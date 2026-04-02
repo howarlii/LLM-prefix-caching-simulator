@@ -1,0 +1,12 @@
+# CPU-only PyTorch (avoid CUDA wheels from PyPI). See README if install fails.
+--extra-index-url https://download.pytorch.org/whl/cpu
+
+datasets>=2.16.0
+tiktoken>=0.7.0
+matplotlib>=3.8.0
+pandas>=2.1.0
+tqdm>=4.66.0
+numpy>=1.26.0
+sentencepiece>=0.2.0
+transformers>=4.45.0
+torch>=2.1.0

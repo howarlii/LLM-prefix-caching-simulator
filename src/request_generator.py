@@ -1,0 +1,215 @@
+"""Tokenize requests, cache token ids, and apply ordering policies."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import multiprocessing as mp
+import os
+import random
+from collections import defaultdict, deque
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Dict, List, Literal, Sequence, Tuple
+
+from tqdm import tqdm
+
+from src.config import DEFAULT_TOKENIZER_NAME, TOKEN_CACHE_DIR, ensure_cpu_only
+from src.datasets_loader import RawRequest
+
+OrderingName = Literal["original", "min_distance", "max_distance", "random"]
+
+
+@dataclass
+class TokenizedRequest:
+    """Request with materialized token ids and grouping metadata."""
+
+    token_ids: List[int]
+    group_id: str
+    meta: dict
+
+
+def _load_tokenizer(name: str):
+    ensure_cpu_only()
+    from transformers import AutoTokenizer
+
+    return AutoTokenizer.from_pretrained(name, trust_remote_code=True)
+
+
+def _chunked(seq: List[str], size: int) -> List[List[str]]:
+    return [seq[i : i + size] for i in range(0, len(seq), size)]
+
+
+def _tokenize_worker(payload: Tuple[str, List[str]]) -> List[List[int]]:
+    name, texts = payload
+    tok = _load_tokenizer(name)
+    out = tok(texts, add_special_tokens=False, padding=False, truncation=False)
+    return out["input_ids"]
+
+
+def tokenize_texts_parallel(
+    texts: List[str],
+    tokenizer_name: str = DEFAULT_TOKENIZER_NAME,
+    batch_size: int = 16,
+    num_workers: int = 0,
+) -> List[List[int]]:
+    """Tokenize many strings; uses processes when ``num_workers > 0``."""
+    if not texts:
+        return []
+    if num_workers <= 0:
+        num_workers = min(8, max(1, (os.cpu_count() or 4)))
+
+    if num_workers == 1:
+        tok = _load_tokenizer(tokenizer_name)
+        result: List[List[int]] = []
+        for i in tqdm(range(0, len(texts), batch_size), desc="Tokenizing", unit="batch"):
+            chunk = texts[i : i + batch_size]
+            batch = tok(chunk, add_special_tokens=False, padding=False, truncation=False)
+            result.extend(batch["input_ids"])
+        return result
+
+    chunks = _chunked(texts, batch_size)
+    args = [(tokenizer_name, ch) for ch in chunks]
+    ctx = mp.get_context("spawn")
+    with ctx.Pool(processes=num_workers) as pool:
+        nested = list(
+            tqdm(
+                pool.imap(_tokenize_worker, args),
+                total=len(args),
+                desc="Tokenizing (parallel)",
+                unit="batch",
+            )
+        )
+    flat: List[List[int]] = []
+    for part in nested:
+        flat.extend(part)
+    return flat
+
+
+def _cache_key_parts(
+    dataset_name: str,
+    tokenizer_name: str,
+    requests: Sequence[RawRequest],
+) -> str:
+    h = hashlib.sha256()
+    h.update(dataset_name.encode())
+    h.update(b"\0")
+    h.update(tokenizer_name.encode())
+    h.update(b"\0")
+    h.update(str(len(requests)).encode())
+    h.update(b"\0")
+    n = len(requests)
+    if n == 0:
+        return h.hexdigest()[:24]
+    # Strided fingerprint so large corpora (e.g. ShareGPT) still differ reliably.
+    stride = max(1, n // 50_000)
+    for i in range(0, n, stride):
+        r = requests[i]
+        h.update(r.group_id.encode())
+        h.update(str(len(r.text)).encode())
+        h.update(b"\0")
+    h.update(requests[-1].group_id.encode())
+    return h.hexdigest()[:24]
+
+
+def load_or_tokenize(
+    dataset_name: str,
+    requests: List[RawRequest],
+    tokenizer_name: str = DEFAULT_TOKENIZER_NAME,
+    *,
+    num_workers: int = 0,
+    batch_size: int = 16,
+    force_recompute: bool = False,
+) -> List[TokenizedRequest]:
+    """Load token ids from disk cache or compute and save."""
+    TOKEN_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    key = _cache_key_parts(dataset_name, tokenizer_name, requests)
+    cache_path = TOKEN_CACHE_DIR / f"{dataset_name}_{key}.jsonl"
+    if cache_path.is_file() and not force_recompute:
+        out: List[TokenizedRequest] = []
+        with cache_path.open(encoding="utf-8") as f:
+            for line, req in zip(f, requests):
+                row = json.loads(line)
+                out.append(
+                    TokenizedRequest(
+                        token_ids=row["token_ids"],
+                        group_id=req.group_id,
+                        meta={**req.meta, **row.get("extra_meta", {})},
+                    )
+                )
+        if len(out) != len(requests):
+            # cache mismatch; recompute
+            out = []
+        else:
+            return out
+
+    texts = [r.text for r in requests]
+    ids_list = tokenize_texts_parallel(
+        texts,
+        tokenizer_name=tokenizer_name,
+        batch_size=batch_size,
+        num_workers=num_workers,
+    )
+    if len(ids_list) != len(requests):
+        raise RuntimeError("tokenization length mismatch")
+
+    with cache_path.open("w", encoding="utf-8") as f:
+        for req, tids in zip(requests, ids_list):
+            f.write(
+                json.dumps(
+                    {"token_ids": tids, "extra_meta": {}},
+                    ensure_ascii=False,
+                )
+                + "\n"
+            )
+
+    return [
+        TokenizedRequest(token_ids=tids, group_id=r.group_id, meta=dict(r.meta))
+        for r, tids in zip(requests, ids_list)
+    ]
+
+
+def order_requests(
+    items: List[TokenizedRequest],
+    mode: OrderingName,
+    seed: int = 0,
+) -> List[TokenizedRequest]:
+    """Reorder tokenized requests for cache-distance experiments."""
+    if mode == "original":
+        return list(items)
+
+    rng = random.Random(seed)
+    by_g: Dict[str, List[TokenizedRequest]] = defaultdict(list)
+    for x in items:
+        by_g[x.group_id].append(x)
+
+    groups = list(by_g.keys())
+    if mode == "random":
+        perm = items.copy()
+        rng.shuffle(perm)
+        return perm
+
+    if mode == "min_distance":
+        # All requests of a group appear consecutively (stable within group).
+        out: List[TokenizedRequest] = []
+        for g in sorted(groups):
+            out.extend(by_g[g])
+        return out
+
+    if mode == "max_distance":
+        # Round-robin across groups so same-group requests are spread out.
+        deques = {g: deque(by_g[g]) for g in groups}
+        order = list(groups)
+        rng.shuffle(order)
+        out = []
+        while True:
+            moved = False
+            for g in order:
+                if deques[g]:
+                    out.append(deques[g].popleft())
+                    moved = True
+            if not moved:
+                break
+        return out
+
+    raise ValueError(f"Unknown ordering {mode!r}")
