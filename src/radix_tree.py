@@ -20,6 +20,8 @@ class RadixNode:
     last_access: float = field(default_factory=time.time)
     access_count: int = 0
     creation_order: int = 0
+    # True if some request ended at this node (multi-turn "previous turn" boundary).
+    is_turn_end: bool = False
 
     def is_leaf(self) -> bool:
         return len(self.children) == 0
@@ -52,24 +54,41 @@ class RadixTree:
     def _add_token_count(self, delta: int) -> None:
         self._token_count += delta
 
-    def simulate_request(self, pages: List[PageKey]) -> Tuple[int, int, int]:
+    def _clear_turn_end_below(self, node: RadixNode) -> None:
+        """Drop turn-end marks on strict descendants (new turn end is shallower)."""
+        q: deque[RadixNode] = deque(node.children.values())
+        while q:
+            n = q.popleft()
+            n.is_turn_end = False
+            q.extend(n.children.values())
+
+    def simulate_request(self, pages: List[PageKey]) -> Tuple[int, int, int, int]:
         """Match longest page prefix, touch hit nodes, insert missing suffix.
 
-        Returns ``(hit_pages, hit_tokens, total_input_tokens)``.
+        Returns ``(hit_pages, hit_tokens, total_input_tokens, turn_hit_tokens)``.
+        ``turn_hit_tokens`` counts tokens for hit pages whose child node was marked
+        as the end of a prior request (continuing the same conversation prefix).
         """
         node = self._root
         hit_pages = 0
         hit_tokens = 0
+        turn_hit_tokens = 0
         for p in pages:
             ch = node.children.get(p)
             if ch is None:
                 break
+            if ch.is_turn_end:
+                turn_hit_tokens += len(p)
             ch.touch()
             hit_pages += 1
             hit_tokens += len(p)
             node = ch
 
+        first_new = True
         for p in pages[hit_pages:]:
+            if first_new and node.is_turn_end:
+                node.is_turn_end = False
+            first_new = False
             order = self._next_creation_order()
             child = RadixNode(
                 page=p,
@@ -81,8 +100,11 @@ class RadixTree:
             self._add_token_count(len(p))
             node = child
 
+        self._clear_turn_end_below(node)
+        node.is_turn_end = True
+
         total_tokens = sum(len(x) for x in pages)
-        return hit_pages, hit_tokens, total_tokens
+        return hit_pages, hit_tokens, total_tokens, turn_hit_tokens
 
     def leaf_nodes(self) -> List[RadixNode]:
         """All leaves (eviction candidates). Root is never evicted."""

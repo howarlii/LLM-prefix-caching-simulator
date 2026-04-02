@@ -23,6 +23,25 @@ _MOONCAKE_TRACE_ALIASES: Dict[str, str] = {
     "conversation_trace": "mooncake_conversation",
 }
 
+# philschmid/sharegpt-raw: raw ShareGPT JSON (duplicated from jeffwan/sharegpt_vicuna).
+_SHAREGPT_RAW_HF_REPO = "philschmid/sharegpt-raw"
+_SHAREGPT_90K_JSON_FILES = (
+    "sharegpt_90k_raw_dataset/sg_90k_part1.json",
+    "sharegpt_90k_raw_dataset/sg_90k_part2.json",
+)
+_SHAREGPT_90K_RAW_ALIASES: Dict[str, str] = {
+    "sharegpt_raw": "sharegpt_90k_raw",
+    "philschmid_sharegpt_raw": "sharegpt_90k_raw",
+}
+
+
+def sharegpt_90k_raw_canonical_name(name: str) -> Optional[str]:
+    """Return ``sharegpt_90k_raw`` if ``name`` refers to that corpus, else ``None``."""
+    n = name.lower()
+    if n == "sharegpt_90k_raw":
+        return "sharegpt_90k_raw"
+    return _SHAREGPT_90K_RAW_ALIASES.get(n)
+
 
 def mooncake_trace_canonical_name(name: str) -> Optional[str]:
     """Return canonical dataset key if ``name`` is a Mooncake JSONL trace, else ``None``."""
@@ -140,6 +159,48 @@ def _iter_narrativeqa(
             )
 
 
+def _normalize_sharegpt_conversation_list(conv: Any) -> List[Any]:
+    """Coerce HF / JSON conversation rows into a list of turn dicts (with optional ``value``)."""
+    if conv is None:
+        return []
+    if hasattr(conv, "tolist"):
+        conv = conv.tolist()
+    if not isinstance(conv, list) or not conv:
+        return []
+    out: List[Any] = []
+    for turn in conv:
+        if isinstance(turn, str):
+            try:
+                turn = json.loads(turn)
+            except json.JSONDecodeError:
+                continue
+        if isinstance(turn, dict):
+            out.append(turn)
+    return out
+
+
+def _yield_sharegpt_style_requests(
+    conv_idx: int,
+    conv: Any,
+    *,
+    meta_dataset: str,
+    group_prefix: str,
+) -> Iterator[RawRequest]:
+    turns = _normalize_sharegpt_conversation_list(conv)
+    if not turns:
+        return
+    acc: List[str] = []
+    for t, turn in enumerate(turns):
+        val = turn.get("value") or ""
+        acc.append(val)
+        text = "".join(acc)
+        yield RawRequest(
+            text=text,
+            group_id=f"{group_prefix}:{conv_idx}",
+            meta={"dataset": meta_dataset, "conv": conv_idx, "turn": t},
+        )
+
+
 def _iter_sharegpt(max_conversations: int = 10_000, seed: int = 0) -> Iterator[RawRequest]:
     ensure_hf_cache_dirs()
     from datasets import load_dataset
@@ -155,26 +216,51 @@ def _iter_sharegpt(max_conversations: int = 10_000, seed: int = 0) -> Iterator[R
         if convo_count >= max_conversations:
             break
         conv = row.get("conversations")
-        if conv is None:
-            continue
-        if hasattr(conv, "tolist"):
-            conv = conv.tolist()
-        if not isinstance(conv, list) or not conv:
+        turns = _normalize_sharegpt_conversation_list(conv)
+        if not turns:
             continue
         convo_count += 1
-        acc: List[str] = []
-        for t, turn in enumerate(conv):
-            if not isinstance(turn, dict):
-                continue
-            val = turn.get("value") or ""
-            acc.append(val)
-            text = "".join(acc)
-            gid = f"sharegpt:{idx}"
-            yield RawRequest(
-                text=text,
-                group_id=gid,
-                meta={"dataset": "sharegpt", "conv": idx, "turn": t},
-            )
+        yield from _yield_sharegpt_style_requests(
+            idx, turns, meta_dataset="sharegpt", group_prefix="sharegpt"
+        )
+
+
+def _iter_sharegpt_90k_raw(
+    max_conversations: int = 10_000,
+    seed: int = 0,
+) -> Iterator[RawRequest]:
+    """Stream philschmid/sharegpt-raw 90k JSON (sharegpt_90k_raw_dataset/, two parts) from Hugging Face."""
+    del seed  # reserved for API parity with other loaders
+    ensure_hf_cache_dirs()
+    import ijson
+    from huggingface_hub import hf_hub_download
+
+    conv_idx = 0
+    convo_count = 0
+    for rel in _SHAREGPT_90K_JSON_FILES:
+        path = hf_hub_download(
+            repo_id=_SHAREGPT_RAW_HF_REPO,
+            filename=rel,
+            repo_type="dataset",
+        )
+        with open(path, "rb") as f:
+            for row in ijson.items(f, "item"):
+                if convo_count >= max_conversations:
+                    return
+                if not isinstance(row, dict):
+                    continue
+                conv = row.get("conversations")
+                turns = _normalize_sharegpt_conversation_list(conv)
+                if not turns:
+                    continue
+                convo_count += 1
+                yield from _yield_sharegpt_style_requests(
+                    conv_idx,
+                    turns,
+                    meta_dataset="sharegpt_90k_raw",
+                    group_prefix="sharegpt_90k_raw",
+                )
+                conv_idx += 1
 
 
 def _iter_mooncake_trace(jsonl_path: Path, dataset_key: str) -> Iterator[RawRequest]:
@@ -240,12 +326,20 @@ def load_raw_requests(
         return list(_iter_narrativeqa(num_documents=narrativeqa_docs, seed=seed))
     if name == "sharegpt":
         return list(_iter_sharegpt(max_conversations=sharegpt_conversations, seed=seed))
+    if sharegpt_90k_raw_canonical_name(name) is not None:
+        return list(
+            _iter_sharegpt_90k_raw(
+                max_conversations=sharegpt_conversations,
+                seed=seed,
+            )
+        )
     moon_key = mooncake_trace_canonical_name(name)
     if moon_key is not None:
         return list(_iter_mooncake_trace(mooncake_trace_jsonl_path(name), moon_key))
     raise ValueError(
-        f"Unknown dataset {name!r}; choose from loogle, narrativeqa, sharegpt, reviewmt, "
-        f"mooncake_toolagent, mooncake_conversation (aliases: toolagent_trace, conversation_trace)"
+        f"Unknown dataset {name!r}; choose from loogle, narrativeqa, sharegpt, sharegpt_90k_raw, "
+        f"reviewmt, mooncake_toolagent, mooncake_conversation (aliases: toolagent_trace, "
+        f"conversation_trace, sharegpt_raw, philschmid_sharegpt_raw)"
     )
 
 

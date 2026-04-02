@@ -2,6 +2,8 @@
 --extra-index-url https://download.pytorch.org/whl/cpu
 
 datasets>=2.16.0
+ijson>=3.2.0
+huggingface_hub>=0.20.0
 tiktoken>=0.7.0
 matplotlib>=3.8.0
 pandas>=2.1.0

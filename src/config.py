@@ -47,6 +47,9 @@ def gb_to_token_capacity(gb: float, kv_bytes_per_token: int = KV_BYTES_PER_TOKEN
 # Qwen3 family tokenizer (design doc: qwen-3.5; use small checkpoint for tokenizer-only).
 DEFAULT_TOKENIZER_NAME = os.environ.get("KV_SIM_TOKENIZER", "Qwen/Qwen3-0.6B")
 
+# Hard cap on encoded input length (tail truncated; head kept — matches default truncation_side).
+# If unset, use each tokenizer's model_max_length (capped sanely). Override example: KV_SIM_MAX_INPUT_TOKENS=65536
+
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DATA_DIR = PROJECT_ROOT / "data"
 TOKEN_CACHE_DIR = DATA_DIR / "tokenized"

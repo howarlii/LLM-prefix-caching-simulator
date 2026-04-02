@@ -27,6 +27,7 @@ class RequestTrace:
     hit_tokens: int
     hit_pages: int
     total_pages: int
+    turn_hit_tokens: int
 
     @property
     def miss_tokens(self) -> int:
@@ -72,12 +73,15 @@ class KVCacheSimulator:
 
     def process_token_ids(self, token_ids: List[int]) -> RequestTrace:
         pages = tokens_to_pages(token_ids, self.page_size)
-        hit_pages, hit_tokens, total_tokens = self.tree.simulate_request(pages)
+        hit_pages, hit_tokens, total_tokens, turn_hit_tokens = self.tree.simulate_request(
+            pages
+        )
         trace = RequestTrace(
             input_tokens=total_tokens,
             hit_tokens=hit_tokens,
             hit_pages=hit_pages,
             total_pages=len(pages),
+            turn_hit_tokens=turn_hit_tokens,
         )
         self._evict_until_fit()
         self.state.record_trace(trace, self.tree.total_cached_tokens())

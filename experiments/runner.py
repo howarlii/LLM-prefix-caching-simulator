@@ -23,6 +23,7 @@ from src.request_generator import (
     load_or_tokenize,
     order_requests,
 )
+from src.strategies import FIFOStrategy, LFUStrategy, LRUStrategy, EvictionStrategy
 
 
 def effective_page_size(dataset: str, page_size: int) -> int:
@@ -30,7 +31,6 @@ def effective_page_size(dataset: str, page_size: int) -> int:
     if is_mooncake_trace_dataset(dataset):
         return 1
     return page_size
-from src.strategies import FIFOStrategy, LFUStrategy, LRUStrategy, EvictionStrategy
 
 
 def strategy_from_name(name: str) -> EvictionStrategy:
@@ -78,6 +78,7 @@ RESULT_CSV_FIELDS: List[str] = [
     "num_requests",
     "page_level_hit_rate",
     "token_level_hit_rate",
+    "turn_level_hit_rate",
     "per_request_hit_rate_mean",
     "per_request_hit_rate_p50",
     "per_request_hit_rate_p90",
@@ -119,6 +120,7 @@ def persist_result_row(
         "num_requests": metrics.get("num_requests"),
         "page_level_hit_rate": metrics.get("page_level_hit_rate"),
         "token_level_hit_rate": metrics.get("token_level_hit_rate"),
+        "turn_level_hit_rate": metrics.get("turn_level_hit_rate"),
         "per_request_hit_rate_mean": metrics.get("per_request_hit_rate_mean"),
         "per_request_hit_rate_p50": metrics.get("per_request_hit_rate_p50"),
         "per_request_hit_rate_p90": metrics.get("per_request_hit_rate_p90"),

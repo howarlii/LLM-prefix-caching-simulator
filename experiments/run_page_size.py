@@ -29,8 +29,8 @@ def main() -> None:
     p.add_argument(
         "--dataset",
         default="loogle",
-        help="loogle | narrativeqa | sharegpt | mooncake_toolagent | mooncake_conversation "
-        "(aliases: toolagent_trace, conversation_trace)",
+        help="loogle | narrativeqa | sharegpt | sharegpt_90k_raw | mooncake_toolagent | "
+        "mooncake_conversation (aliases: toolagent_trace, conversation_trace, sharegpt_raw)",
     )
     p.add_argument(
         "--page-sizes",
@@ -108,7 +108,7 @@ def main() -> None:
         persist_result_row(args.out_csv, args.out_json_dir, row)
         print(
             f"page_size={ps} token_hr={metrics.token_level_hit_rate:.4f} "
-            f"page_hr={metrics.page_level_hit_rate:.4f}"
+            f"page_hr={metrics.page_level_hit_rate:.4f} turn_hr={metrics.turn_level_hit_rate:.4f}"
         )
 
 

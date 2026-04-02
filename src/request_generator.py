@@ -36,14 +36,45 @@ def _load_tokenizer(name: str):
     return AutoTokenizer.from_pretrained(name, trust_remote_code=True)
 
 
+def _encode_max_length(tok) -> int:
+    """Per-sequence cap for tokenization (min of env, tokenizer model_max_length)."""
+    m = getattr(tok, "model_max_length", None)
+    if m is None or m > 1_000_000:
+        m = 131_072
+    raw = os.environ.get("KV_SIM_MAX_INPUT_TOKENS", "").strip()
+    if raw.isdigit():
+        u = int(raw)
+        if u > 0:
+            return min(u, m)
+    return m
+
+
 def _chunked(seq: List[str], size: int) -> List[List[str]]:
     return [seq[i : i + size] for i in range(0, len(seq), size)]
 
 
-def _tokenize_worker(payload: Tuple[str, List[str]]) -> List[List[int]]:
-    name, texts = payload
-    tok = _load_tokenizer(name)
-    out = tok(texts, add_special_tokens=False, padding=False, truncation=False)
+# One tokenizer per spawn worker — avoid AutoTokenizer.from_pretrained on every batch
+# (Qwen3 path can call the Hub model_info API; 10k+ loads → 429 rate limit).
+_worker_tok = None
+_worker_encode_max_len: int = 131_072
+
+
+def _tokenize_worker_init(args: Tuple[str, int]) -> None:
+    tokenizer_name, encode_max_len = args
+    global _worker_tok, _worker_encode_max_len
+    _worker_tok = _load_tokenizer(tokenizer_name)
+    _worker_encode_max_len = encode_max_len
+
+
+def _tokenize_worker(texts: List[str]) -> List[List[int]]:
+    assert _worker_tok is not None
+    out = _worker_tok(
+        texts,
+        add_special_tokens=False,
+        padding=False,
+        truncation=True,
+        max_length=_worker_encode_max_len,
+    )
     return out["input_ids"]
 
 
@@ -52,30 +83,41 @@ def tokenize_texts_parallel(
     tokenizer_name: str = DEFAULT_TOKENIZER_NAME,
     batch_size: int = 16,
     num_workers: int = 0,
+    *,
+    encode_max_length: int,
 ) -> List[List[int]]:
-    """Tokenize many strings; uses processes when ``num_workers > 0``."""
+    """Tokenize many strings; uses processes when ``num_workers > 1``."""
     if not texts:
         return []
     if num_workers <= 0:
-        num_workers = min(8, max(1, (os.cpu_count() or 4)))
+        num_workers = max(1, (os.cpu_count() or 4))
 
     if num_workers == 1:
         tok = _load_tokenizer(tokenizer_name)
         result: List[List[int]] = []
         for i in tqdm(range(0, len(texts), batch_size), desc="Tokenizing", unit="batch"):
             chunk = texts[i : i + batch_size]
-            batch = tok(chunk, add_special_tokens=False, padding=False, truncation=False)
+            batch = tok(
+                chunk,
+                add_special_tokens=False,
+                padding=False,
+                truncation=True,
+                max_length=encode_max_length,
+            )
             result.extend(batch["input_ids"])
         return result
 
     chunks = _chunked(texts, batch_size)
-    args = [(tokenizer_name, ch) for ch in chunks]
     ctx = mp.get_context("spawn")
-    with ctx.Pool(processes=num_workers) as pool:
+    with ctx.Pool(
+        processes=num_workers,
+        initializer=_tokenize_worker_init,
+        initargs=((tokenizer_name, encode_max_length),),
+    ) as pool:
         nested = list(
             tqdm(
-                pool.imap(_tokenize_worker, args),
-                total=len(args),
+                pool.imap(_tokenize_worker, chunks),
+                total=len(chunks),
                 desc="Tokenizing (parallel)",
                 unit="batch",
             )
@@ -90,11 +132,15 @@ def _cache_key_parts(
     dataset_name: str,
     tokenizer_name: str,
     requests: Sequence[RawRequest],
+    *,
+    encode_max_length: int,
 ) -> str:
     h = hashlib.sha256()
     h.update(dataset_name.encode())
     h.update(b"\0")
     h.update(tokenizer_name.encode())
+    h.update(b"\0")
+    h.update(str(encode_max_length).encode())
     h.update(b"\0")
     h.update(str(len(requests)).encode())
     h.update(b"\0")
@@ -123,7 +169,12 @@ def load_or_tokenize(
 ) -> List[TokenizedRequest]:
     """Load token ids from disk cache or compute and save."""
     TOKEN_CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    key = _cache_key_parts(dataset_name, tokenizer_name, requests)
+    _tok = _load_tokenizer(tokenizer_name)
+    encode_max_length = _encode_max_length(_tok)
+    del _tok
+    key = _cache_key_parts(
+        dataset_name, tokenizer_name, requests, encode_max_length=encode_max_length
+    )
     cache_path = TOKEN_CACHE_DIR / f"{dataset_name}_{key}.jsonl"
     if cache_path.is_file() and not force_recompute:
         out: List[TokenizedRequest] = []
@@ -149,6 +200,7 @@ def load_or_tokenize(
         tokenizer_name=tokenizer_name,
         batch_size=batch_size,
         num_workers=num_workers,
+        encode_max_length=encode_max_length,
     )
     if len(ids_list) != len(requests):
         raise RuntimeError("tokenization length mismatch")

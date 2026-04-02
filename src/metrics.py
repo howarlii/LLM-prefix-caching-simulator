@@ -31,6 +31,7 @@ class RunMetrics:
 
     page_level_hit_rate: float
     token_level_hit_rate: float
+    turn_level_hit_rate: float
     per_request_hit_rate_mean: float
     per_request_hit_rate_p50: float
     per_request_hit_rate_p90: float
@@ -61,6 +62,7 @@ def compute_run_metrics(
         return RunMetrics(
             page_level_hit_rate=0.0,
             token_level_hit_rate=0.0,
+            turn_level_hit_rate=0.0,
             per_request_hit_rate_mean=0.0,
             per_request_hit_rate_p50=0.0,
             per_request_hit_rate_p90=0.0,
@@ -91,8 +93,11 @@ def compute_run_metrics(
     peak = max(usage) if usage else 0
     avg_u = sum(usage) / len(usage) if usage else 0.0
 
+    turn_hit_tokens = sum(t.turn_hit_tokens for t in traces)
+
     page_hr = hit_pages / total_pages_needed if total_pages_needed else 0.0
     tok_hr = load_tokens / total_in if total_in else 0.0
+    turn_hr = turn_hit_tokens / total_in if total_in else 0.0
     lcr = load_tokens / compute_tokens if compute_tokens else float("inf")
 
     dh = tree.depth_histogram()
@@ -130,6 +135,7 @@ def compute_run_metrics(
     return RunMetrics(
         page_level_hit_rate=page_hr,
         token_level_hit_rate=tok_hr,
+        turn_level_hit_rate=turn_hr,
         per_request_hit_rate_mean=sum(pr_rates) / len(pr_rates),
         per_request_hit_rate_p50=_percentile(pr_sorted, 50),
         per_request_hit_rate_p90=_percentile(pr_sorted, 90),
