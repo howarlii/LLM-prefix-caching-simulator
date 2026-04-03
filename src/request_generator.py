@@ -135,6 +135,12 @@ def _cache_key_parts(
     *,
     encode_max_length: int,
 ) -> str:
+    """Return a hash that is stable for any prefix-subset of the same base dataset.
+
+    ``len(requests)`` is intentionally excluded from the hash so that runs with
+    different ``--max-requests`` values share the same base key.  The count is
+    embedded separately in the cache filename instead.
+    """
     h = hashlib.sha256()
     h.update(dataset_name.encode())
     h.update(b"\0")
@@ -142,19 +148,18 @@ def _cache_key_parts(
     h.update(b"\0")
     h.update(str(encode_max_length).encode())
     h.update(b"\0")
-    h.update(str(len(requests)).encode())
-    h.update(b"\0")
     n = len(requests)
     if n == 0:
         return h.hexdigest()[:24]
-    # Strided fingerprint so large corpora (e.g. ShareGPT) still differ reliably.
-    stride = max(1, n // 50_000)
-    for i in range(0, n, stride):
+    # Use the first min(n, 200) requests as a prefix-stable fingerprint.
+    # This is invariant across different --max-requests values drawn from the
+    # same base dataset ordering.
+    sample_end = min(n, 200)
+    for i in range(sample_end):
         r = requests[i]
         h.update(r.group_id.encode())
         h.update(str(len(r.text)).encode())
         h.update(b"\0")
-    h.update(requests[-1].group_id.encode())
     return h.hexdigest()[:24]
 
 
@@ -175,11 +180,14 @@ def load_or_tokenize(
     key = _cache_key_parts(
         dataset_name, tokenizer_name, requests, encode_max_length=encode_max_length
     )
-    cache_path = TOKEN_CACHE_DIR / f"{dataset_name}_{key}.jsonl"
-    if cache_path.is_file() and not force_recompute:
+    n = len(requests)
+    cache_path = TOKEN_CACHE_DIR / f"{dataset_name}_{key}_n{n}.jsonl"
+
+    def _try_load(path: Path, want: int) -> List[TokenizedRequest]:
+        """Read the first ``want`` lines from a cache file; return [] on mismatch."""
         out: List[TokenizedRequest] = []
-        with cache_path.open(encoding="utf-8") as f:
-            for line, req in zip(f, requests):
+        with path.open(encoding="utf-8") as f:
+            for req, line in zip(requests, f):
                 row = json.loads(line)
                 out.append(
                     TokenizedRequest(
@@ -188,11 +196,27 @@ def load_or_tokenize(
                         meta={**req.meta, **row.get("extra_meta", {})},
                     )
                 )
-        if len(out) != len(requests):
-            # cache mismatch; recompute
-            out = []
-        else:
-            return out
+        return out if len(out) == want else []
+
+    if not force_recompute:
+        # 1. Exact match.
+        if cache_path.is_file():
+            out = _try_load(cache_path, n)
+            if out:
+                return out
+
+        # 2. Superset: any cached file for the same dataset+key with count >= n.
+        prefix = f"{dataset_name}_{key}_n"
+        for candidate in sorted(TOKEN_CACHE_DIR.glob(f"{prefix}*.jsonl")):
+            stem = candidate.stem  # e.g. "loogle_abc123_n2000"
+            try:
+                cached_n = int(stem[len(prefix):])
+            except ValueError:
+                continue
+            if cached_n >= n:
+                out = _try_load(candidate, n)
+                if out:
+                    return out
 
     texts = [r.text for r in requests]
     ids_list = tokenize_texts_parallel(

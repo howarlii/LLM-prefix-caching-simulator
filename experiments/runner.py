@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import csv
 import json
+import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, cast
 
@@ -23,7 +24,7 @@ from src.request_generator import (
     load_or_tokenize,
     order_requests,
 )
-from src.strategies import FIFOStrategy, LFUStrategy, LRUStrategy, EvictionStrategy
+from src.strategies import FIFOStrategy, LFUStrategy, LRUStrategy, MarconiStrategy, EvictionStrategy
 
 
 def effective_page_size(dataset: str, page_size: int) -> int:
@@ -41,6 +42,11 @@ def strategy_from_name(name: str) -> EvictionStrategy:
         return LFUStrategy()
     if n == "fifo":
         return FIFOStrategy()
+    if n == "marconi" or n.startswith("marconi_"):
+        # Optional alpha suffix: "marconi_2.0" → alpha=2.0
+        parts = n.split("_", 1)
+        alpha = float(parts[1]) if len(parts) == 2 else 1.0
+        return MarconiStrategy(alpha=alpha)
     raise ValueError(f"Unknown strategy {name!r}")
 
 
@@ -57,13 +63,15 @@ def run_simulation(
     page_size: int,
     strategy: EvictionStrategy,
     capacity_tokens: Optional[int],
+    mamba_state_token_equiv: int = 0,
 ) -> RunMetrics:
     sim = KVCacheSimulator(
         page_size=page_size,
         strategy=strategy,
         capacity_tokens=capacity_tokens,
+        mamba_state_token_equiv=mamba_state_token_equiv,
     )
-    for req in tqdm(requests, desc="Simulating", leave=False):
+    for req in tqdm(requests, desc="Simulating", leave=False, disable=not sys.stderr.isatty()):
         sim.process_token_ids(req.token_ids)
     return compute_run_metrics(sim.state, sim.tree)
 
@@ -75,6 +83,7 @@ RESULT_CSV_FIELDS: List[str] = [
     "strategy",
     "capacity_spec",
     "tokenizer",
+    "mamba_state_token_equiv",
     "num_requests",
     "page_level_hit_rate",
     "token_level_hit_rate",
@@ -89,8 +98,8 @@ RESULT_CSV_FIELDS: List[str] = [
     "peak_cached_tokens",
     "avg_cached_tokens",
     "total_input_tokens",
-    "tree_depth_histogram_json",
-    "tree_access_by_depth_json",
+    "compute_savings_rate",
+    "kv_only_hit_pages",
 ]
 
 
@@ -117,6 +126,7 @@ def persist_result_row(
         "strategy": row.get("strategy"),
         "capacity_spec": row.get("capacity_spec"),
         "tokenizer": row.get("tokenizer"),
+        "mamba_state_token_equiv": row.get("mamba_state_token_equiv", 0),
         "num_requests": metrics.get("num_requests"),
         "page_level_hit_rate": metrics.get("page_level_hit_rate"),
         "token_level_hit_rate": metrics.get("token_level_hit_rate"),
@@ -131,20 +141,40 @@ def persist_result_row(
         "peak_cached_tokens": metrics.get("peak_cached_tokens"),
         "avg_cached_tokens": metrics.get("avg_cached_tokens"),
         "total_input_tokens": metrics.get("total_input_tokens"),
-        "tree_depth_histogram_json": json.dumps(
-            metrics.get("tree_depth_histogram", {}), ensure_ascii=False
-        ),
-        "tree_access_by_depth_json": json.dumps(
-            metrics.get("tree_access_by_depth", {}), ensure_ascii=False
-        ),
+        "compute_savings_rate": metrics.get("compute_savings_rate"),
+        "kv_only_hit_pages": metrics.get("kv_only_hit_pages"),
     }
 
-    write_header = not out_csv.is_file()
-    with out_csv.open("a", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=RESULT_CSV_FIELDS, extrasaction="ignore")
-        if write_header:
+    KEY_FIELDS = ("dataset", "page_size", "ordering", "strategy", "capacity_spec")
+
+    new_row = {k: flat.get(k, "") for k in RESULT_CSV_FIELDS}
+    key = tuple(str(new_row.get(k, "")) for k in KEY_FIELDS)
+
+    if out_csv.is_file():
+        with out_csv.open("r", newline="", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            existing = list(reader)
+
+        replaced = False
+        for i, r in enumerate(existing):
+            if tuple(str(r.get(k, "")) for k in KEY_FIELDS) == key:
+                existing[i] = new_row
+                replaced = True
+                break
+
+        if not replaced:
+            existing.append(new_row)
+
+        with out_csv.open("w", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=RESULT_CSV_FIELDS, extrasaction="ignore")
             w.writeheader()
-        w.writerow({k: flat.get(k, "") for k in RESULT_CSV_FIELDS})
+            w.writerows({k: r.get(k, "") for k in RESULT_CSV_FIELDS} for r in existing)
+    else:
+        out_csv.parent.mkdir(parents=True, exist_ok=True)
+        with out_csv.open("w", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=RESULT_CSV_FIELDS, extrasaction="ignore")
+            w.writeheader()
+            w.writerow(new_row)
 
 
 def prepare_requests(

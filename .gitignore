@@ -26,6 +26,9 @@
 *.a
 *.lib
 
+#macos
+.DS_Store
+
 # Executables
 *.exe
 *.out
@@ -35,6 +38,7 @@
 build/
 bin/
 .cache/
+.venv/
 
 # vscode
 .vscode/

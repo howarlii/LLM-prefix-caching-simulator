@@ -48,6 +48,13 @@ class RunMetrics:
     tree_access_by_depth: Dict[str, Any]
     # Per-depth min/p50/p90/p99/max of node access_count (for distribution plots).
     access_percentiles_by_depth: Dict[str, Dict[str, float]]
+    # Fraction of input blocks (pages) where full computation was saved.
+    # For pure full-attention this equals page_level_hit_rate.
+    # For hybrid models, only blocks reachable via a Mamba state checkpoint count.
+    compute_savings_rate: float = 0.0
+    # Total pages that were present in the KV cache but NOT covered by a Mamba
+    # state checkpoint (hybrid mode only; always 0 for pure full-attention).
+    kv_only_hit_pages: int = 0
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -78,6 +85,8 @@ def compute_run_metrics(
             valid_cached_depth_histogram={},
             tree_access_by_depth={},
             access_percentiles_by_depth={},
+            compute_savings_rate=0.0,
+            kv_only_hit_pages=0,
         )
 
     total_pages_needed = sum(t.total_pages for t in traces)
@@ -85,6 +94,7 @@ def compute_run_metrics(
     total_in = sum(t.input_tokens for t in traces)
     load_tokens = sum(t.hit_tokens for t in traces)
     compute_tokens = sum(t.miss_tokens for t in traces)
+    kv_only_hit_pages = sum(t.kv_only_hit_pages for t in traces)
 
     pr_rates = [t.per_request_token_hit_rate for t in traces]
     pr_sorted = sorted(pr_rates)
@@ -99,6 +109,12 @@ def compute_run_metrics(
     tok_hr = load_tokens / total_in if total_in else 0.0
     turn_hr = turn_hit_tokens / total_in if total_in else 0.0
     lcr = load_tokens / compute_tokens if compute_tokens else float("inf")
+
+    # compute_savings_rate: fraction of blocks where full computation was saved.
+    # In pure full-attention mode this equals page_level_hit_rate.
+    # In hybrid mode, hit_pages already accounts for Mamba state gating, so
+    # this gives the true fraction of blocks that avoid recomputation entirely.
+    compute_savings_rate = page_hr
 
     dh = tree.depth_histogram()
     vch = tree.valid_cached_depth_histogram()
@@ -151,4 +167,6 @@ def compute_run_metrics(
         valid_cached_depth_histogram=valid_cached_depth_histogram,
         tree_access_by_depth=tree_access_by_depth,
         access_percentiles_by_depth=access_percentiles_by_depth,
+        compute_savings_rate=compute_savings_rate,
+        kv_only_hit_pages=kv_only_hit_pages,
     )
