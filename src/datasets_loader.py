@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import itertools
 import json
 import random
 from dataclasses import dataclass
@@ -263,6 +264,53 @@ def _iter_sharegpt_90k_raw(
                 conv_idx += 1
 
 
+def _yield_chat_messages_requests(
+    conv_idx: int,
+    messages: Any,
+    *,
+    meta_dataset: str,
+    group_prefix: str,
+) -> Iterator[RawRequest]:
+    """Yield cumulative-prefix requests from a ``[{role, content}, ...]`` message list."""
+    if not isinstance(messages, list) or not messages:
+        return
+    acc: List[str] = []
+    for t, msg in enumerate(messages):
+        if not isinstance(msg, dict):
+            continue
+        content = msg.get("content") or ""
+        acc.append(content)
+        text = "".join(acc)
+        yield RawRequest(
+            text=text,
+            group_id=f"{group_prefix}:{conv_idx}",
+            meta={"dataset": meta_dataset, "conv": conv_idx, "turn": t},
+        )
+
+
+def _iter_swe_smith(max_conversations: int = 10_000) -> Iterator[RawRequest]:
+    """Stream SWE-smith 66k trajectories (role/content chat format)."""
+    ensure_hf_cache_dirs()
+    from datasets import load_dataset
+
+    ds = load_dataset(
+        "Kwai-Klear/SWE-smith-mini_swe_agent_plus-trajectories-66k",
+        split="train",
+        streaming=True,
+    )
+    convo_count = 0
+    for idx, row in enumerate(ds):
+        if convo_count >= max_conversations:
+            break
+        messages = row.get("messages")
+        if not isinstance(messages, list) or not messages:
+            continue
+        convo_count += 1
+        yield from _yield_chat_messages_requests(
+            idx, messages, meta_dataset="swe_smith", group_prefix="swe_smith"
+        )
+
+
 def _iter_mooncake_trace(jsonl_path: Path, dataset_key: str) -> Iterator[RawRequest]:
     """Load Mooncake-style traces: each line has timestamp, lengths, and hash_ids (block ids)."""
     if not jsonl_path.is_file():
@@ -326,6 +374,10 @@ def load_raw_requests(
         return list(_iter_narrativeqa(num_documents=narrativeqa_docs, seed=seed))
     if name == "sharegpt":
         return list(_iter_sharegpt(max_conversations=sharegpt_conversations, seed=seed))
+    if name in ("swe_smith", "swesmith", "swe-smith"):
+        return list(
+            _iter_swe_smith(max_conversations=sharegpt_conversations)
+        )
     if sharegpt_90k_raw_canonical_name(name) is not None:
         return list(
             _iter_sharegpt_90k_raw(
@@ -338,8 +390,8 @@ def load_raw_requests(
         return list(_iter_mooncake_trace(mooncake_trace_jsonl_path(name), moon_key))
     raise ValueError(
         f"Unknown dataset {name!r}; choose from loogle, narrativeqa, sharegpt, sharegpt_90k_raw, "
-        f"reviewmt, mooncake_toolagent, mooncake_conversation (aliases: toolagent_trace, "
-        f"conversation_trace, sharegpt_raw, philschmid_sharegpt_raw)"
+        f"swe_smith, reviewmt, mooncake_toolagent, mooncake_conversation (aliases: toolagent_trace, "
+        f"conversation_trace, sharegpt_raw, philschmid_sharegpt_raw, swesmith, swe-smith)"
     )
 
 

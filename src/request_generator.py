@@ -261,13 +261,24 @@ def order_requests(
 
     groups = list(by_g.keys())
     if mode == "random":
-        perm = items.copy()
-        rng.shuffle(perm)
-        return perm
+        # Shuffle inter-group ordering while preserving intra-group turn order.
+        # This models random conversation arrival times but causal turn dependencies.
+        queues = {g: deque(by_g[g]) for g in groups}
+        active = list(groups)
+        rng.shuffle(active)
+        out: List[TokenizedRequest] = []
+        while active:
+            # Pick a random active group and take its next turn.
+            idx = rng.randrange(len(active))
+            g = active[idx]
+            out.append(queues[g].popleft())
+            if not queues[g]:
+                active.pop(idx)
+        return out
 
     if mode == "min_distance":
         # All requests of a group appear consecutively (stable within group).
-        out: List[TokenizedRequest] = []
+        out = []
         for g in sorted(groups):
             out.extend(by_g[g])
         return out
