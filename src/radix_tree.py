@@ -13,7 +13,6 @@ to the original pure full-attention simulation.
 
 from __future__ import annotations
 
-import time
 from collections import deque
 from dataclasses import dataclass, field
 from typing import Dict, Iterator, List, Optional, Tuple
@@ -28,7 +27,7 @@ class RadixNode:
     page: PageKey
     parent: Optional[RadixNode] = None
     children: Dict[PageKey, RadixNode] = field(default_factory=dict)
-    last_access: float = field(default_factory=time.time)
+    last_access: int = 0.0
     access_count: int = 0
     creation_order: int = 0
     # True if some request ended at this node (multi-turn "previous turn" boundary).
@@ -39,8 +38,8 @@ class RadixNode:
     def is_leaf(self) -> bool:
         return len(self.children) == 0
 
-    def touch(self) -> None:
-        self.last_access = time.time()
+    def touch(self, timestamp: int = 0.0) -> None:
+        self.last_access = timestamp
         self.access_count += 1
 
 
@@ -58,6 +57,7 @@ class RadixTree:
     def __init__(self, mamba_state_token_equiv: int = 0) -> None:
         self._root = RadixNode(page=())
         self._node_counter = 0
+        self._clock = 0  # monotonic logical timestamp (incremented per request)
         self._token_count = 0
         self._mamba_state_token_equiv = mamba_state_token_equiv
         self._mamba_state_count = 0  # nodes currently carrying a Mamba state
@@ -65,6 +65,11 @@ class RadixTree:
     @property
     def root(self) -> RadixNode:
         return self._root
+
+    @property
+    def clock(self) -> int:
+        """Current logical timestamp (incremented once per ``simulate_request``)."""
+        return self._clock
 
     @property
     def mamba_state_token_equiv(self) -> int:
@@ -108,16 +113,12 @@ class RadixTree:
             self._mamba_state_count -= 1
 
     def _clear_turn_end_below(self, node: RadixNode) -> None:
-        """Drop turn-end marks on strict descendants (new turn end is shallower)."""
-        q: deque[RadixNode] = deque(node.children.values())
-        while q:
-            n = q.popleft()
-            n.is_turn_end = False
-            q.extend(n.children.values())
+        """No-op: once a node is marked as a turn end, it stays that way."""
+        pass
 
     def simulate_request(
         self, pages: List[PageKey]
-    ) -> Tuple[int, int, int, int, int, List[RadixNode]]:
+    ) -> Tuple[int, int, int, int, int, List[RadixNode], List[RadixNode]]:
         """Match longest page prefix, touch hit nodes, insert missing suffix.
 
         Returns
@@ -143,7 +144,13 @@ class RadixTree:
         new_nodes : List[RadixNode]
             Newly inserted nodes (suffix that was not cached).  The caller
             (simulator) uses these to apply the admission policy.
+        matched_nodes : List[RadixNode]
+            Nodes that were matched during the prefix walk (cache hits).
+            Used by strategies that need to update per-node metadata on hits.
         """
+        self._clock += 1
+        ts = self._clock
+
         node = self._root
         matched_nodes: List[RadixNode] = []
 
@@ -151,7 +158,7 @@ class RadixTree:
             ch = node.children.get(p)
             if ch is None:
                 break
-            ch.touch()
+            ch.touch(ts)
             matched_nodes.append(ch)
             node = ch
 
@@ -183,18 +190,14 @@ class RadixTree:
 
         # Insert suffix pages (always starting from full match depth, not effective hit).
         new_nodes: List[RadixNode] = []
-        first_new = True
         for p in pages[match_depth:]:
-            if first_new and node.is_turn_end:
-                node.is_turn_end = False
-            first_new = False
             order = self._next_creation_order()
             child = RadixNode(
                 page=p,
                 parent=node,
                 creation_order=order,
             )
-            child.touch()
+            child.touch(ts)
             node.children[p] = child
             self._add_token_count(len(p))
             new_nodes.append(child)
@@ -204,7 +207,7 @@ class RadixTree:
         node.is_turn_end = True
 
         total_tokens = sum(len(x) for x in pages)
-        return hit_pages, hit_tokens, kv_only_hit_pages, total_tokens, turn_hit_tokens, new_nodes
+        return hit_pages, hit_tokens, kv_only_hit_pages, total_tokens, turn_hit_tokens, new_nodes, matched_nodes
 
     def leaf_nodes(self) -> List[RadixNode]:
         """All leaves (eviction candidates). Root is never evicted."""
@@ -243,6 +246,10 @@ class RadixTree:
     def _prune_empty_chain(self, node: RadixNode) -> None:
         cur: Optional[RadixNode] = node
         while cur is not None and cur is not self._root and len(cur.children) == 0:
+            # In hybrid mode, preserve nodes that carry a Mamba state —
+            # they serve as recomputation checkpoints for descendants.
+            if self._mamba_state_token_equiv > 0 and cur.has_mamba_state:
+                break
             self._remove_node_accounting(cur)
             parent = cur.parent
             if parent is None:

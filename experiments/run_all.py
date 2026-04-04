@@ -43,11 +43,12 @@ DATASET_NAMES = "sharegpt_90k_raw"
 DATASET_NAMES = "swesmith"
 # DATASET_NAMES = "loogle"
 for page_size in [32, 256, 1024]:
-    for capacity in [20, 40, 80, 160, 320, 'inf']:
+    for capacity in [40, 80, 160, 320, 'inf']:
         # EXPERIMENTS.append(dict(dataset=DATASET_NAMES, page_size=page_size, ordering="original", strategy="marconi", mamba_state_token_equiv="1000", capacity=capacity))
         # EXPERIMENTS.append(dict(dataset=DATASET_NAMES, page_size=page_size, ordering="original", strategy="lru", mamba_state_token_equiv="1000", capacity=capacity))
-        EXPERIMENTS.append(dict(dataset=DATASET_NAMES, page_size=page_size, ordering="random", strategy="marconi", mamba_state_token_equiv="1000", capacity=capacity))
-        EXPERIMENTS.append(dict(dataset=DATASET_NAMES, page_size=page_size, ordering="random", strategy="lru", mamba_state_token_equiv="1000", capacity=capacity))
+        # EXPERIMENTS.append(dict(dataset=DATASET_NAMES, page_size=page_size, ordering="random", strategy="marconi", mamba_state_token_equiv="1000", capacity=capacity))
+        # EXPERIMENTS.append(dict(dataset=DATASET_NAMES, page_size=page_size, ordering="random", strategy="lru", mamba_state_token_equiv="1000", capacity=capacity))
+        EXPERIMENTS.append(dict(dataset=DATASET_NAMES, page_size=page_size, ordering="random", strategy="crf_decoupling", mamba_state_token_equiv="1000", capacity=capacity))
 
 # DATASET_NAMES = "mooncake_toolagent"
 # for page_size in [1, 8, 32]:
@@ -64,7 +65,7 @@ DEFAULTS: dict = dict(
 )
 
 # ── How many experiments to run in parallel ───────────────────────────────────
-MAX_WORKERS = 1
+MAX_WORKERS = 10
 # ─────────────────────────────────────────────────────────────────────────────
 
 

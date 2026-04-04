@@ -55,6 +55,17 @@ class EvictionStrategy(ABC):
         """
         return []
 
+    def on_cache_hit(
+        self, tree: RadixTree, matched_nodes: List[RadixNode]
+    ) -> None:
+        """Called once per request with the nodes that were matched (cache hit).
+
+        Strategies that maintain per-node metadata (e.g. CRF scores) can
+        override this to update their bookkeeping on hits.
+        Default: no-op.
+        """
+        return
+
     def on_new_nodes_inserted(
         self, tree: RadixTree, new_nodes: List[RadixNode]
     ) -> None:

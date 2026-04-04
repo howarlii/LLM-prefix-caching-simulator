@@ -96,9 +96,13 @@ class KVCacheSimulator:
 
     def process_token_ids(self, token_ids: List[int]) -> RequestTrace:
         pages = tokens_to_pages(token_ids, self.page_size)
-        hit_pages, hit_tokens, kv_only_hit_pages, total_tokens, turn_hit_tokens, new_nodes = (
+        hit_pages, hit_tokens, kv_only_hit_pages, total_tokens, turn_hit_tokens, new_nodes, matched_nodes = (
             self.tree.simulate_request(pages)
         )
+
+        # Notify the strategy about cache hits (for CRF / metadata updates).
+        if matched_nodes:
+            self.strategy.on_cache_hit(self.tree, matched_nodes)
 
         # Admission: for each newly inserted node, ask the strategy whether to
         # store a Mamba state.  Skipped entirely in pure full-attention mode.
