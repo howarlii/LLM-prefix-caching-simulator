@@ -41,10 +41,11 @@ EXPERIMENTS: list[dict] = [
 
 DATASET_NAMES = "sharegpt_90k_raw"
 DATASET_NAMES = "swesmith"
+# DATASET_NAMES = "loogle"
 for page_size in [32, 256, 1024]:
-    for capacity in [20, 40, 80, 160, 'inf']:
-        EXPERIMENTS.append(dict(dataset=DATASET_NAMES, page_size=page_size, ordering="original", strategy="marconi", mamba_state_token_equiv="1000", capacity=capacity))
-        EXPERIMENTS.append(dict(dataset=DATASET_NAMES, page_size=page_size, ordering="original", strategy="lru", mamba_state_token_equiv="1000", capacity=capacity))
+    for capacity in [20, 40, 80, 160, 320, 'inf']:
+        # EXPERIMENTS.append(dict(dataset=DATASET_NAMES, page_size=page_size, ordering="original", strategy="marconi", mamba_state_token_equiv="1000", capacity=capacity))
+        # EXPERIMENTS.append(dict(dataset=DATASET_NAMES, page_size=page_size, ordering="original", strategy="lru", mamba_state_token_equiv="1000", capacity=capacity))
         EXPERIMENTS.append(dict(dataset=DATASET_NAMES, page_size=page_size, ordering="random", strategy="marconi", mamba_state_token_equiv="1000", capacity=capacity))
         EXPERIMENTS.append(dict(dataset=DATASET_NAMES, page_size=page_size, ordering="random", strategy="lru", mamba_state_token_equiv="1000", capacity=capacity))
 
@@ -59,7 +60,7 @@ for page_size in [32, 256, 1024]:
 # ── Applied to every experiment unless the experiment dict overrides them ─────
 DEFAULTS: dict = dict(
     max_requests=5000,
-    tokenize_workers=4,
+    tokenize_workers=90,
 )
 
 # ── How many experiments to run in parallel ───────────────────────────────────
