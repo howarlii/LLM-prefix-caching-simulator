@@ -28,26 +28,26 @@ _MIN_CHAIN_TOKENS_FOR_MID_CHECKPOINT = 2048
 
 def _depth_tokens_from_checkpoint(node: RadixNode) -> int:
     """Token distance from the nearest ancestor with Mamba state (or root) to *node* (inclusive)."""
-    d = len(node.page)
+    d = node.num_tokens
     cur = node.parent
     while cur is not None and cur.parent is not None:
         if cur.has_mamba_state:
             return d
-        d += len(cur.page)
+        d += cur.num_tokens
         cur = cur.parent
     return d
 
 
 def _estimate_leaf_free(leaf: RadixNode) -> int:
     """Estimate tokens freed by removing a leaf and pruning its empty chain."""
-    total = len(leaf.page)
+    total = leaf.num_tokens
     cur = leaf.parent
     while cur is not None and cur.parent is not None:
         if len(cur.children) > 1:
             break
         if cur.has_mamba_state:
             break
-        total += len(cur.page)
+        total += cur.num_tokens
         cur = cur.parent
     return total
 
@@ -77,13 +77,10 @@ class Marconi2Strategy(EvictionStrategy):
         """
         mte = tree.mamba_state_token_equiv
 
-        mamba_candidates: List[RadixNode] = []
-        leaf_candidates: List[RadixNode] = []
-        for n in tree.iter_nodes():
-            if n.is_leaf():
-                leaf_candidates.append(n)
-            if n.has_mamba_state and len(n.children) <= 1:
-                mamba_candidates.append(n)
+        leaf_candidates: List[RadixNode] = list(tree.leaf_node_set())
+        mamba_candidates: List[RadixNode] = [
+            n for n in tree.mamba_state_node_set() if len(n.children) <= 1
+        ]
 
         all_nodes: List[Tuple[RadixNode, EvictOp]] = (
             [(n, "mamba") for n in mamba_candidates]
@@ -127,7 +124,11 @@ class Marconi2Strategy(EvictionStrategy):
     def on_new_nodes_inserted(
         self, tree: RadixTree, new_nodes: List[RadixNode]
     ) -> None:
-        """Handle fork-point parent admission + mid-chain checkpoint placement."""
+        """Handle fork-point parent admission + mid-chain checkpoint placement.
+
+        With compressed multi-page nodes, new_nodes is typically a single node.
+        If a mid-chain checkpoint is needed inside that node, we split it.
+        """
         if not new_nodes:
             return
 
@@ -138,16 +139,17 @@ class Marconi2Strategy(EvictionStrategy):
                 tree.set_mamba_state(parent)
 
         # --- Mid-chain checkpoint at ~55% ---
+        # Compute token gap from last checkpoint/root to the start of new nodes.
         anchor = new_nodes[0].parent
         tokens_before_chain = 0
         cur = anchor
         while cur is not None and cur.parent is not None:
             if cur.has_mamba_state:
                 break
-            tokens_before_chain += len(cur.page)
+            tokens_before_chain += cur.num_tokens
             cur = cur.parent
 
-        chain_tokens = sum(len(n.page) for n in new_nodes)
+        chain_tokens = sum(n.num_tokens for n in new_nodes)
         total_span = tokens_before_chain + chain_tokens
 
         if total_span < _MIN_CHAIN_TOKENS_FOR_MID_CHECKPOINT:
@@ -156,6 +158,7 @@ class Marconi2Strategy(EvictionStrategy):
         target_pos = int(total_span * 0.55)
 
         if target_pos <= tokens_before_chain:
+            # Target falls in ancestor chain above new nodes.
             remaining = tokens_before_chain - target_pos
             candidate = anchor
             while candidate is not None and candidate.parent is not None:
@@ -163,21 +166,49 @@ class Marconi2Strategy(EvictionStrategy):
                     break
                 if remaining <= 0:
                     break
-                remaining -= len(candidate.page)
+                remaining -= candidate.num_tokens
                 if remaining <= 0:
                     break
                 candidate = candidate.parent
             if candidate is not None and candidate is not tree.root and not candidate.has_mamba_state:
+                # If target falls inside a multi-page node, split it.
+                if candidate.num_pages > 1:
+                    # Approximate: place checkpoint at a page boundary near the target.
+                    offset_in_node = candidate.num_tokens + remaining  # remaining is <= 0
+                    pages_to_keep = 0
+                    cum = 0
+                    for p in candidate.pages:
+                        cum += len(p)
+                        pages_to_keep += 1
+                        if cum >= offset_in_node:
+                            break
+                    if 0 < pages_to_keep < candidate.num_pages:
+                        tree.split_node(candidate, pages_to_keep)
+                        # After split, candidate IS the prefix — set mamba on it.
                 tree.set_mamba_state(candidate)
         else:
+            # Target falls within the new nodes.
             offset_in_chain = target_pos - tokens_before_chain
             cumulative = 0
             for node in new_nodes:
-                cumulative += len(node.page)
-                if cumulative >= offset_in_chain:
+                if cumulative + node.num_tokens >= offset_in_chain:
+                    # Target is inside this node.  Find the page boundary.
+                    offset_in_node = offset_in_chain - cumulative
+                    if offset_in_node > 0 and node.num_pages > 1:
+                        pages_to_keep = 0
+                        cum = 0
+                        for p in node.pages:
+                            cum += len(p)
+                            pages_to_keep += 1
+                            if cum >= offset_in_node:
+                                break
+                        if 0 < pages_to_keep < node.num_pages:
+                            tree.split_node(node, pages_to_keep)
+                            # After split, node IS the prefix.
                     if not node.has_mamba_state:
                         tree.set_mamba_state(node)
                     break
+                cumulative += node.num_tokens
 
     # ------------------------------------------------------------------
     # Eviction — unified via select_eviction
@@ -192,21 +223,3 @@ class Marconi2Strategy(EvictionStrategy):
             return None
         _, node, op = scored[0]
         return (node, op)
-
-    def select_nodes(self, tree: RadixTree, num_nodes: int) -> List[RadixNode]:
-        """Fallback for non-hybrid mode."""
-        leaves = tree.leaf_nodes()
-        if not leaves:
-            return []
-        recencies = [n.last_access for n in leaves]
-        depths = [_depth_tokens_from_checkpoint(n) for n in leaves]
-        min_r, max_r = min(recencies), max(recencies)
-        min_d, max_d = min(depths), max(depths)
-
-        scored: List[Tuple[float, RadixNode]] = []
-        for n, r, d in zip(leaves, recencies, depths):
-            norm_r = (r - min_r) / (max_r - min_r) if max_r > min_r else 0.0
-            norm_d = (d - min_d) / (max_d - min_d) if max_d > min_d else 0.0
-            scored.append((norm_r + self.alpha * norm_d, n))
-        scored.sort(key=lambda x: x[0])
-        return [n for _, n in scored[:num_nodes]]

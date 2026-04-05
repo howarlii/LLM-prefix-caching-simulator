@@ -1,5 +1,13 @@
 """Page-granularity radix tree for prefix KV cache simulation.
 
+Compressed multi-page nodes
+---------------------------
+Each node stores one or more consecutive pages (a compressed Patricia trie).
+When a new request diverges mid-node, the node is split at the divergence
+point.  This dramatically reduces chain length when ``page_size`` is small
+(e.g. 1), since an entire suffix is stored in a single node rather than
+one node per page.
+
 Hybrid-model extension
 ----------------------
 When ``mamba_state_token_equiv > 0`` the tree operates in hybrid mode (e.g.
@@ -15,16 +23,17 @@ from __future__ import annotations
 
 from collections import deque
 from dataclasses import dataclass, field
-from typing import Dict, Iterator, List, Optional, Tuple
+from typing import Dict, Iterator, List, Optional, Set, Tuple
 
 PageKey = Tuple[int, ...]
 
 
 @dataclass
 class RadixNode:
-    """One node = one cached page (variable length for the final partial page)."""
+    """One node = one or more consecutive cached pages."""
 
-    page: PageKey
+    pages: Tuple[PageKey, ...]
+    num_tokens: int = 0
     parent: Optional[RadixNode] = None
     children: Dict[PageKey, RadixNode] = field(default_factory=dict)
     last_access: int = 0
@@ -34,6 +43,13 @@ class RadixNode:
     is_turn_end: bool = False
     # True if a Mamba SSM state is stored at this node (hybrid-model mode).
     has_mamba_state: bool = False
+
+    # Identity-based hash so nodes can live in sets.
+    __hash__ = object.__hash__
+
+    @property
+    def num_pages(self) -> int:
+        return len(self.pages)
 
     def is_leaf(self) -> bool:
         return len(self.children) == 0
@@ -55,12 +71,18 @@ class RadixTree:
     """
 
     def __init__(self, mamba_state_token_equiv: int = 0) -> None:
-        self._root = RadixNode(page=())
+        self._root = RadixNode(pages=())
         self._node_counter = 0
         self._clock = 0  # monotonic logical timestamp (incremented per request)
         self._token_count = 0
         self._mamba_state_token_equiv = mamba_state_token_equiv
         self._mamba_state_count = 0  # nodes currently carrying a Mamba state
+        # Incremental indexes — avoid full-tree BFS on every eviction call.
+        self._leaf_set: Set[RadixNode] = set()
+        self._mamba_state_nodes: Set[RadixNode] = set()
+        # Split log for external consumers (e.g. tree logger / viewer).
+        # Each entry: (old_id, prefix_id, prefix_pid, prefix_len, suffix_id, suffix_len)
+        self._pending_splits: List[Tuple[int, int, int, int, int, int]] = []
 
     @property
     def root(self) -> RadixNode:
@@ -96,25 +118,106 @@ class RadixTree:
         if not node.has_mamba_state:
             node.has_mamba_state = True
             self._mamba_state_count += 1
+            self._mamba_state_nodes.add(node)
 
     def evict_mamba_state(self, node: RadixNode) -> None:
         """Drop only the Mamba state of *node*, keeping its KV cache (idempotent)."""
         if node.has_mamba_state:
             node.has_mamba_state = False
             self._mamba_state_count -= 1
+            self._mamba_state_nodes.discard(node)
 
     def _add_token_count(self, delta: int) -> None:
         self._token_count += delta
 
     def _remove_node_accounting(self, node: RadixNode) -> None:
         """Subtract KV tokens and Mamba state for a node being removed."""
-        self._token_count -= len(node.page)
+        self._token_count -= node.num_tokens
         if node.has_mamba_state:
             self._mamba_state_count -= 1
+            self._mamba_state_nodes.discard(node)
 
-    def _clear_turn_end_below(self, node: RadixNode) -> None:
-        """No-op: once a node is marked as a turn end, it stays that way."""
-        pass
+    # ------------------------------------------------------------------
+    # Node splitting
+    # ------------------------------------------------------------------
+
+    def split_node(self, node: RadixNode, split_at: int) -> RadixNode:
+        """Split *node* at page boundary *split_at*.
+
+        Mutates *node* in place to become the prefix (first *split_at* pages).
+        Creates and returns a new suffix child that inherits the original
+        node's children, ``is_turn_end``, and ``has_mamba_state``.
+
+        The parent's ``children`` dict key remains valid because the prefix
+        keeps the same first page.
+
+        Returns the suffix node.
+        """
+        assert 0 < split_at < node.num_pages
+
+        old_id = node.creation_order  # capture before mutation
+        prefix_pages = node.pages[:split_at]
+        suffix_pages = node.pages[split_at:]
+        prefix_tokens = sum(len(p) for p in prefix_pages)
+        suffix_tokens = node.num_tokens - prefix_tokens
+
+        suffix = RadixNode(
+            pages=suffix_pages,
+            num_tokens=suffix_tokens,
+            parent=node,
+            children=node.children,
+            last_access=node.last_access,
+            access_count=node.access_count,
+            creation_order=node.creation_order,
+            is_turn_end=node.is_turn_end,
+            has_mamba_state=node.has_mamba_state,
+        )
+
+        # Update grandchildren's parent pointers.
+        for child in suffix.children.values():
+            child.parent = suffix
+
+        # Mutate node to become the prefix.
+        node.pages = prefix_pages
+        node.num_tokens = prefix_tokens
+        node.children = {suffix_pages[0]: suffix}
+        node.creation_order = self._next_creation_order()
+        node.is_turn_end = False
+        node.has_mamba_state = False
+
+        # Update leaf tracking: node had leaf status iff it was a leaf before.
+        # After split, node has a child (suffix) so it is no longer a leaf.
+        # Suffix is a leaf iff the original node was a leaf.
+        if node in self._leaf_set:
+            self._leaf_set.discard(node)
+            self._leaf_set.add(suffix)
+
+        # Update mamba tracking: mamba state moves to suffix.
+        if suffix.has_mamba_state:
+            self._mamba_state_nodes.discard(node)
+            self._mamba_state_nodes.add(suffix)
+
+        # Record for logger: (old_id, prefix_id, prefix_pid, prefix_len, suffix_id, suffix_len)
+        parent_id = node.parent.creation_order if node.parent else 0
+        self._pending_splits.append((
+            old_id, node.creation_order, parent_id,
+            node.num_tokens, suffix.creation_order, suffix.num_tokens,
+        ))
+
+        return suffix
+
+    def drain_pending_splits(self) -> List[Tuple[int, int, int, int, int, int]]:
+        """Return and clear pending split records for logging.
+
+        Each entry: ``(old_id, prefix_id, prefix_pid, prefix_len, suffix_id, suffix_len)``.
+        """
+        out = self._pending_splits
+        self._pending_splits = []
+        return out
+
+    # ------------------------------------------------------------------
+    # Request simulation
+    # ------------------------------------------------------------------
 
     def simulate_request(
         self, pages: List[PageKey]
@@ -124,113 +227,136 @@ class RadixTree:
         Returns
         -------
         hit_pages : int
-            Pages that are fully usable from cache.
-            *Pure full-attention*: all matched pages.
-            *Hybrid*: pages up to (and including) the deepest matched node that
-            carries a Mamba state.
         hit_tokens : int
-            Token count corresponding to ``hit_pages``.
         kv_only_hit_pages : int
-            Pages that are present in the KV cache but *beyond* the last Mamba
-            state checkpoint — their KV is cached but computation cannot be
-            skipped without the Mamba state.  Always 0 in pure full-attention
-            mode.
         total_input_tokens : int
-            Total tokens in this request.
         turn_hit_tokens : int
-            Tokens for hit pages whose node was marked as the end of a prior
-            request (conversation-turn continuation), gated by the same Mamba
-            state rule as ``hit_pages``.
         new_nodes : List[RadixNode]
-            Newly inserted nodes (suffix that was not cached).  The caller
-            (simulator) uses these to apply the admission policy.
         matched_nodes : List[RadixNode]
-            Nodes that were matched during the prefix walk (cache hits).
-            Used by strategies that need to update per-node metadata on hits.
         """
         self._clock += 1
         ts = self._clock
 
         node = self._root
         matched_nodes: List[RadixNode] = []
+        page_idx = 0
 
-        for p in pages:
-            ch = node.children.get(p)
+        while page_idx < len(pages):
+            ch = node.children.get(pages[page_idx])
             if ch is None:
                 break
-            ch.touch(ts)
-            matched_nodes.append(ch)
-            node = ch
 
-        match_depth = len(matched_nodes)
+            # Compare ch.pages against incoming pages.
+            ch_pages = ch.pages
+            match_len = 0
+            for i in range(len(ch_pages)):
+                if page_idx + i >= len(pages) or pages[page_idx + i] != ch_pages[i]:
+                    break
+                match_len += 1
+            else:
+                match_len = len(ch_pages)
+
+            if match_len == len(ch_pages):
+                # Full match of this node.
+                ch.touch(ts)
+                matched_nodes.append(ch)
+                node = ch
+                page_idx += len(ch_pages)
+            else:
+                # Partial match — split at the divergence point.
+                self.split_node(ch, match_len)
+                # After split, ch IS the prefix (mutated in place).
+                ch.touch(ts)
+                matched_nodes.append(ch)
+                node = ch
+                page_idx += match_len
+                break
+
+        # Build cumulative page/token counts for matched nodes.
+        cum_pages: List[int] = []
+        cum_tokens: List[int] = []
+        cp, ct = 0, 0
+        for n in matched_nodes:
+            cp += n.num_pages
+            ct += n.num_tokens
+            cum_pages.append(cp)
+            cum_tokens.append(ct)
+
+        total_matched_pages = cp
+        total_matched_tokens = ct
 
         # Determine effective hit depth (gated by Mamba state in hybrid mode).
         if self._mamba_state_token_equiv > 0:
-            effective_hit = 0
+            effective_hit_idx = -1
             for i, n in enumerate(matched_nodes):
                 if n.has_mamba_state:
-                    effective_hit = i + 1
-            hit_pages = effective_hit
-            hit_tokens = sum(len(matched_nodes[i].page) for i in range(effective_hit))
-            kv_only_hit_pages = match_depth - effective_hit
+                    effective_hit_idx = i
+            if effective_hit_idx >= 0:
+                hit_pages = cum_pages[effective_hit_idx]
+                hit_tokens = cum_tokens[effective_hit_idx]
+            else:
+                hit_pages = 0
+                hit_tokens = 0
+            kv_only_hit_pages = total_matched_pages - hit_pages
         else:
-            effective_hit = match_depth
-            hit_pages = match_depth
-            hit_tokens = sum(len(n.page) for n in matched_nodes)
+            hit_pages = total_matched_pages
+            hit_tokens = total_matched_tokens
             kv_only_hit_pages = 0
 
         # Turn hit: tokens up to the deepest is_turn_end node within effective hit range.
-        # A cache hit is only usable from a turn boundary; if the match ends mid-turn,
-        # walk back to the nearest turn_end ancestor (analogous to Mamba state gating).
-        effective_turn_end = 0
-        for i in range(effective_hit):
+        effective_range = (effective_hit_idx + 1) if self._mamba_state_token_equiv > 0 else len(matched_nodes)
+        turn_hit_tokens = 0
+        for i in range(effective_range):
             if matched_nodes[i].is_turn_end:
-                effective_turn_end = i + 1
-        turn_hit_tokens = sum(len(matched_nodes[i].page) for i in range(effective_turn_end))
+                turn_hit_tokens = cum_tokens[i]
 
-        # Insert suffix pages (always starting from full match depth, not effective hit).
+        # Insert remaining suffix as a single compressed node.
         new_nodes: List[RadixNode] = []
-        for p in pages[match_depth:]:
+        remaining = pages[page_idx:]
+        if remaining:
+            self._leaf_set.discard(node)
             order = self._next_creation_order()
             child = RadixNode(
-                page=p,
+                pages=tuple(remaining),
+                num_tokens=sum(len(p) for p in remaining),
                 parent=node,
                 creation_order=order,
             )
             child.touch(ts)
-            node.children[p] = child
-            self._add_token_count(len(p))
+            node.children[remaining[0]] = child
+            self._add_token_count(child.num_tokens)
             new_nodes.append(child)
+            self._leaf_set.add(child)
             node = child
 
-        self._clear_turn_end_below(node)
         node.is_turn_end = True
 
         total_tokens = sum(len(x) for x in pages)
         return hit_pages, hit_tokens, kv_only_hit_pages, total_tokens, turn_hit_tokens, new_nodes, matched_nodes
 
+    # ------------------------------------------------------------------
+    # Leaf / mamba accessors (backed by incremental indexes)
+    # ------------------------------------------------------------------
+
     def leaf_nodes(self) -> List[RadixNode]:
         """All leaves (eviction candidates). Root is never evicted."""
-        out: List[RadixNode] = []
-        q: deque[RadixNode] = deque(self._root.children.values())
-        while q:
-            n = q.popleft()
-            if n.is_leaf():
-                out.append(n)
-            else:
-                q.extend(n.children.values())
-        return out
+        return list(self._leaf_set)
+
+    def leaf_node_set(self) -> Set[RadixNode]:
+        """Direct access to the leaf set (read-only view — do not mutate)."""
+        return self._leaf_set
 
     def nodes_with_mamba_state(self) -> List[RadixNode]:
         """All non-root nodes that currently carry a Mamba state."""
-        out: List[RadixNode] = []
-        q: deque[RadixNode] = deque(self._root.children.values())
-        while q:
-            n = q.popleft()
-            if n.has_mamba_state:
-                out.append(n)
-            q.extend(n.children.values())
-        return out
+        return list(self._mamba_state_nodes)
+
+    def mamba_state_node_set(self) -> Set[RadixNode]:
+        """Direct access to the mamba state node set (read-only view — do not mutate)."""
+        return self._mamba_state_nodes
+
+    # ------------------------------------------------------------------
+    # Removal
+    # ------------------------------------------------------------------
 
     def remove_leaf(self, node: RadixNode) -> List[RadixNode]:
         """Remove a leaf and prune ancestors until a branch or root is reached.
@@ -240,18 +366,23 @@ class RadixTree:
         """
         if node is self._root or not node.is_leaf():
             return []
+        self._leaf_set.discard(node)
         self._remove_node_accounting(node)
         parent = node.parent
-        if parent is None or node.page not in parent.children:
+        if parent is None or node.pages[0] not in parent.children:
             return [node]
-        del parent.children[node.page]
-        pruned = self._prune_empty_chain(parent)
+        del parent.children[node.pages[0]]
+        pruned, survivor = self._prune_empty_chain(parent)
+        # The survivor may have become a leaf after pruning.
+        if survivor is not self._root and survivor.is_leaf():
+            self._leaf_set.add(survivor)
         return [node] + pruned
 
-    def _prune_empty_chain(self, node: RadixNode) -> List[RadixNode]:
+    def _prune_empty_chain(self, node: RadixNode) -> Tuple[List[RadixNode], RadixNode]:
+        """Prune childless ancestors. Returns (removed_nodes, surviving_ancestor)."""
         removed: List[RadixNode] = []
-        cur: Optional[RadixNode] = node
-        while cur is not None and cur is not self._root and len(cur.children) == 0:
+        cur: RadixNode = node
+        while cur is not self._root and len(cur.children) == 0:
             # In hybrid mode, preserve nodes that carry a Mamba state —
             # they serve as recomputation checkpoints for descendants.
             if self._mamba_state_token_equiv > 0 and cur.has_mamba_state:
@@ -260,15 +391,19 @@ class RadixTree:
             parent = cur.parent
             if parent is None:
                 break
-            pk = cur.page
+            pk = cur.pages[0]
             if pk in parent.children:
                 del parent.children[pk]
             removed.append(cur)
             cur = parent
-        return removed
+        return removed, cur
+
+    # ------------------------------------------------------------------
+    # Traversal utilities
+    # ------------------------------------------------------------------
 
     def iter_nodes(self) -> Iterator[RadixNode]:
-        """Breadth-first over all nodes except the empty root (no stack overflow on deep chains)."""
+        """Breadth-first over all nodes except the empty root."""
         q: deque[RadixNode] = deque([self._root])
         while q:
             n = q.popleft()
@@ -277,21 +412,19 @@ class RadixTree:
             q.extend(n.children.values())
 
     def depth_histogram(self) -> Dict[int, int]:
-        """Map depth (1 = first page below root) -> number of nodes."""
-
+        """Map depth (in pages, 1 = first page below root) -> number of nodes."""
         hist: Dict[int, int] = {}
         q: deque[tuple[RadixNode, int]] = deque([(self._root, 0)])
         while q:
             n, depth = q.popleft()
             if n is not self._root:
                 hist[depth] = hist.get(depth, 0) + 1
-                depth += 1
+                depth += n.num_pages
             q.extend((c, depth) for c in n.children.values())
         return hist
 
     def valid_cached_depth_histogram(self) -> Dict[int, int]:
-        """Per tree depth, weighted branching mass: nodes with x>1 children add (x-1) at that depth."""
-
+        """Per tree depth (pages), weighted branching mass."""
         hist: Dict[int, int] = {}
         q: deque[tuple[RadixNode, int]] = deque([(self._root, 0)])
         while q:
@@ -300,18 +433,18 @@ class RadixTree:
                 x = len(n.children)
                 if x > 1:
                     hist[depth] = hist.get(depth, 0) + (x - 1)
-                depth += 1
+                depth += n.num_pages
             q.extend((c, depth) for c in n.children.values())
         return hist
 
     def visit_counts_by_depth(self) -> Dict[int, List[int]]:
-        """For each depth, list of ``access_count`` values (for analysis)."""
+        """For each depth (pages), list of ``access_count`` values."""
         by_depth: Dict[int, List[int]] = {}
         q: deque[tuple[RadixNode, int]] = deque([(self._root, 0)])
         while q:
             n, depth = q.popleft()
             if n is not self._root:
                 by_depth.setdefault(depth, []).append(n.access_count)
-                depth += 1
+                depth += n.num_pages
             q.extend((c, depth) for c in n.children.values())
         return by_depth

@@ -44,21 +44,21 @@ def _depth_tokens(node: RadixNode) -> int:
     d = 0
     n: RadixNode | None = node
     while n is not None and n.parent is not None:
-        d += len(n.page)
+        d += n.num_tokens
         n = n.parent
     return d
 
 
 def _estimate_leaf_free(leaf: RadixNode) -> int:
     """Estimate tokens freed by removing a leaf and pruning its empty chain."""
-    total = len(leaf.page)
+    total = leaf.num_tokens
     cur = leaf.parent
     while cur is not None and cur.parent is not None:
         if len(cur.children) > 1:
             break
         if cur.has_mamba_state:
             break
-        total += len(cur.page)
+        total += cur.num_tokens
         cur = cur.parent
     return total
 
@@ -109,13 +109,10 @@ class MarconiStrategy(EvictionStrategy):
         """
         mte = tree.mamba_state_token_equiv
 
-        mamba_candidates: List[RadixNode] = []
-        leaf_candidates: List[RadixNode] = []
-        for n in tree.iter_nodes():
-            if n.is_leaf():
-                leaf_candidates.append(n)
-            if n.has_mamba_state and len(n.children) <= 1:
-                mamba_candidates.append(n)
+        leaf_candidates: List[RadixNode] = list(tree.leaf_node_set())
+        mamba_candidates: List[RadixNode] = [
+            n for n in tree.mamba_state_node_set() if len(n.children) <= 1
+        ]
 
         all_nodes: List[Tuple[RadixNode, EvictOp]] = (
             [(n, "mamba") for n in mamba_candidates]
@@ -157,21 +154,3 @@ class MarconiStrategy(EvictionStrategy):
             return None
         _, node, op = scored[0]
         return (node, op)
-
-    def select_nodes(self, tree: RadixTree, num_nodes: int) -> List[RadixNode]:
-        """Fallback for non-hybrid mode (no mamba states)."""
-        leaves = tree.leaf_nodes()
-        if not leaves:
-            return []
-        recencies = [n.last_access for n in leaves]
-        depths = [_depth_tokens(n) for n in leaves]
-        min_r, max_r = min(recencies), max(recencies)
-        min_d, max_d = min(depths), max(depths)
-
-        scored: List[Tuple[float, RadixNode]] = []
-        for n, r, d in zip(leaves, recencies, depths):
-            norm_r = (r - min_r) / (max_r - min_r) if max_r > min_r else 0.0
-            norm_d = (d - min_d) / (max_d - min_d) if max_d > min_d else 0.0
-            scored.append((norm_r + self.alpha * norm_d, n))
-        scored.sort(key=lambda x: x[0])
-        return [n for _, n in scored[:num_nodes]]

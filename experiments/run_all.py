@@ -76,21 +76,23 @@ MAX_WORKERS     = 100
 EXPERIMENTS: list[dict] = []
 
 # Example: sweep page_size × capacity for marconi and marconi2
-# for ds in ["swesmith", "loogle", "narrativeqa", "sharegpt_90k_raw"]:
-#     for page_size in [32, 256, 1024]:
-#         for capacity in [80, 160, 320, "inf"]:
-#             EXPERIMENTS.append(dict(page_size=page_size, dataset=ds, strategy="marconi",  capacity=capacity))
-#             EXPERIMENTS.append(dict(page_size=page_size, dataset=ds, strategy="marconi2", capacity=capacity))
+for ds in ["swesmith", "loogle", "narrativeqa", "sharegpt_90k_raw"]:
+    # for page_size in [32, 256, 1024]:
+    for page_size in [1]:
+        for capacity in [80, 160, 320, 640, "inf"]:
+            EXPERIMENTS.append(dict(page_size=page_size, dataset=ds, strategy="marconi",  capacity=capacity))
+            EXPERIMENTS.append(dict(page_size=page_size, dataset=ds, strategy="marconi2", capacity=capacity))
 
 # Log datasets
-# ENABLE_LOG      = True
-# MAX_REQUESTS    = 1000
-# capacity = "160GB"
-# EXPERIMENTS: list[dict] = []
-# for ds in ["swesmith", "loogle", "narrativeqa", "sharegpt_90k_raw"]:
-#     for page_size in [32, 256]:
-#         EXPERIMENTS.append(dict(page_size=page_size, strategy="marconi",  capacity=capacity, dataset=ds))
-#         EXPERIMENTS.append(dict(page_size=page_size, strategy="marconi2",  capacity=capacity, dataset=ds))
+ENABLE_LOG      = True
+MAX_REQUESTS    = 1000
+capacity = "inf"
+EXPERIMENTS: list[dict] = []
+for ds in ["swesmith", "loogle", "narrativeqa", "sharegpt_90k_raw"]:
+    # for page_size in [1, 32, 256]:
+    for page_size in [1]:
+        EXPERIMENTS.append(dict(page_size=page_size, strategy="marconi",  capacity=capacity, dataset=ds))
+        EXPERIMENTS.append(dict(page_size=page_size, strategy="marconi2",  capacity=capacity, dataset=ds))
 
 # ╔═══════════════════════════════════════════════════════════════════════════╗
 # ║                       END OF CONFIGURATION                                ║

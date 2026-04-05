@@ -22,17 +22,14 @@ gives more weight to frequency; larger ``lambda`` favours recency.
 Nodes without a Mamba state do not maintain CRF scores — they cannot
 save computation on their own, so tracking their popularity is pointless.
 
-The strategy integrates with the existing two-phase eviction loop
-(``select_mamba_state_evictions`` then ``select_nodes``) but compares
-per-byte value across both operations to decide whether a Mamba-state
-demotion is cheaper than a chain eviction.
+The strategy uses unified ``select_eviction`` to compare per-byte value
+across both operations.
 """
 
 from __future__ import annotations
 
 import math
 import warnings
-from collections import deque
 from typing import List, Optional, Tuple
 
 from src.radix_tree import RadixNode, RadixTree
@@ -46,12 +43,12 @@ def _delta_mamba(node: RadixNode) -> int:
 
     If no ancestor carries Mamba state the gap spans from root to *node*.
     """
-    total = len(node.page)
+    total = node.num_tokens
     cur = node.parent
     while cur is not None and cur.parent is not None:
         if cur.has_mamba_state:
             return total
-        total += len(cur.page)
+        total += cur.num_tokens
         cur = cur.parent
     return total
 
@@ -186,7 +183,7 @@ class CRFDecouplingStrategy(EvictionStrategy):
         chain_tokens = 0
         s_chain = 0
         for n in chain:
-            toks = len(n.page)
+            toks = n.num_tokens
             chain_tokens += toks
             s_chain += toks
             if n.has_mamba_state:
@@ -214,18 +211,8 @@ class CRFDecouplingStrategy(EvictionStrategy):
         mte = tree.mamba_state_token_equiv
         t_now = tree.clock
 
-        # Single tree traversal: collect mamba-state candidates and leaves.
-        mamba_candidates: List[RadixNode] = []
-        leaves: List[RadixNode] = []
-        q: deque[RadixNode] = deque(tree.root.children.values())
-        while q:
-            n = q.popleft()
-            if n.has_mamba_state:
-                mamba_candidates.append(n)
-            if n.is_leaf():
-                leaves.append(n)
-            else:
-                q.extend(n.children.values())
+        leaves: List[RadixNode] = list(tree.leaf_node_set())
+        mamba_candidates: List[RadixNode] = list(tree.mamba_state_node_set())
 
         # Best Operation A: mamba-state demotion (non-branching nodes only)
         best_a: Optional[RadixNode] = None
@@ -263,32 +250,3 @@ class CRFDecouplingStrategy(EvictionStrategy):
         if best_b_leaf is not None:
             return (best_b_leaf, "leaf")
         return None
-
-    def select_nodes(self, tree: RadixTree, num_nodes: int) -> List[RadixNode]:
-        """Fallback for non-hybrid mode: chain eviction only."""
-        leaves = tree.leaf_nodes()
-        if not leaves:
-            return []
-
-        mte = tree.mamba_state_token_equiv
-        t_now = tree.clock
-
-        if num_nodes == 1:
-            best_leaf: Optional[RadixNode] = None
-            best_score = float("inf")
-            for leaf in leaves:
-                chain = self._compute_chain(leaf)
-                sb, _ = self._score_b_chain(chain, mte, t_now)
-                if sb < best_score:
-                    best_score = sb
-                    best_leaf = leaf
-            return [best_leaf] if best_leaf is not None else []
-
-        scored: List[Tuple[float, RadixNode]] = []
-        for leaf in leaves:
-            chain = self._compute_chain(leaf)
-            sb, _ = self._score_b_chain(chain, mte, t_now)
-            scored.append((sb, leaf))
-
-        scored.sort(key=lambda x: x[0])
-        return [n for _, n in scored[:num_nodes]]

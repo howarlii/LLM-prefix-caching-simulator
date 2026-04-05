@@ -17,16 +17,10 @@ class EvictionStrategy(ABC):
     Eviction
     --------
     ``select_eviction``
-        The main entry point called by the simulator when over capacity.
+        The sole entry point called by the simulator when over capacity.
         Returns ``(node, "mamba")`` to drop only the Mamba state, or
         ``(node, "leaf")`` to remove the leaf entirely, or ``None`` if
         nothing can be evicted.
-
-        The default implementation falls back to
-        ``select_mamba_state_evictions`` then ``select_nodes`` (preserving
-        legacy behaviour for simple strategies like LRU/LFU/FIFO).
-        Strategies that want unified scoring (e.g. Marconi) should override
-        ``select_eviction`` directly.
 
     Hybrid-model hooks
     ------------------
@@ -36,12 +30,13 @@ class EvictionStrategy(ABC):
     """
 
     @abstractmethod
-    def select_nodes(self, tree: RadixTree, num_nodes: int) -> List[RadixNode]:
-        """Return up to ``num_nodes`` leaf nodes to remove entirely.
+    def select_eviction(
+        self, tree: RadixTree
+    ) -> Optional[Tuple[RadixNode, EvictOp]]:
+        """Pick the single best eviction action.
 
-        Implementations should only return nodes that are safe to delete
-        (typically leaves). Fewer than ``num_nodes`` may be returned if the
-        tree has fewer evictable nodes.
+        Returns ``(node, "mamba")`` to drop only the Mamba state, or
+        ``(node, "leaf")`` to remove the leaf entirely, or ``None``.
         """
         raise NotImplementedError
 
@@ -53,36 +48,6 @@ class EvictionStrategy(ABC):
         Default: always admit.
         """
         return True
-
-    def select_mamba_state_evictions(
-        self, tree: RadixTree, num_states: int
-    ) -> List[RadixNode]:
-        """Return up to ``num_states`` nodes from which to evict *only* the
-        Mamba state (the KV cache pages are kept in place).
-
-        Default: return empty list (never demote).
-        """
-        return []
-
-    def select_eviction(
-        self, tree: RadixTree
-    ) -> Optional[Tuple[RadixNode, EvictOp]]:
-        """Pick the single best eviction action.
-
-        Returns ``(node, "mamba")`` to drop only the Mamba state, or
-        ``(node, "leaf")`` to remove the leaf entirely, or ``None``.
-
-        Default: try ``select_mamba_state_evictions`` first, then
-        ``select_nodes`` (legacy two-phase behaviour for simple strategies).
-        Override this for unified scoring.
-        """
-        mamba = self.select_mamba_state_evictions(tree, 1)
-        if mamba:
-            return (mamba[0], "mamba")
-        leaves = self.select_nodes(tree, 1)
-        if leaves:
-            return (leaves[0], "leaf")
-        return None
 
     def on_cache_hit(
         self, tree: RadixTree, matched_nodes: List[RadixNode]

@@ -3,6 +3,7 @@
 Writes one JSON object per line.  Event types::
 
     R  – request start   {e,rid,clk,ntok}
+    SP – node split      {e,oid,pid,ppid,plen,sid,slen}
     H  – cache hit node  {e,id,ac,la[,crf]}
     I  – node inserted   {e,id,pid,len}
     MS – mamba state set {e,id}
@@ -85,7 +86,19 @@ class TreeLogger:
             "e": "I",
             "id": node.creation_order,
             "pid": pid,
-            "len": len(node.page),
+            "len": node.num_tokens,
+        })
+
+    def split(self, old_id: int, prefix_id: int, prefix_pid: int,
+              prefix_len: int, suffix_id: int, suffix_len: int) -> None:
+        self._write({
+            "e": "SP",
+            "oid": old_id,
+            "pid": prefix_id,
+            "ppid": prefix_pid,
+            "plen": prefix_len,
+            "sid": suffix_id,
+            "slen": suffix_len,
         })
 
     def mamba_set(self, node: RadixNode) -> None:

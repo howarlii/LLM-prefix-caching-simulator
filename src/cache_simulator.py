@@ -130,8 +130,13 @@ class KVCacheSimulator:
             self.strategy.on_new_nodes_inserted(self.tree, new_nodes)
 
         # 4. Log AFTER all strategy hooks, so CRF values are up-to-date.
+        # Always drain pending splits to avoid memory leak.
+        pending_splits = self.tree.drain_pending_splits()
         if log:
             log.request_start(rid, self.tree.clock, total_tokens)
+            # Splits (from simulate_request prefix walk + on_new_nodes_inserted)
+            for sp in pending_splits:
+                log.split(*sp)
             # Hits — CRF has been updated by on_cache_hit already
             for n in matched_nodes:
                 log.hit(n)

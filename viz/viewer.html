@@ -30,9 +30,12 @@ button:disabled{opacity:0.4;cursor:default}
 #speed{width:60px;text-align:center;font-size:12px;background:#0a0a1a;color:#e0e0e0;border:1px solid #0f3460;border-radius:4px;padding:2px}
 .node circle{}
 .node text{font-size:10px;fill:#c0c0e0}
-.link{fill:none;stroke:#445;stroke-width:1.2px}
-.link-dead{fill:none;stroke:#222;stroke-width:0.8px;stroke-dasharray:3,3}
+.link{fill:none}
 #tooltip{position:absolute;background:#16213eee;border:1px solid #0f3460;border-radius:6px;padding:8px 12px;font-size:11px;line-height:1.6;pointer-events:none;display:none;z-index:100;max-width:280px;white-space:pre-line}
+#legend{position:absolute;bottom:8px;left:8px;background:#16213ecc;border:1px solid #0f3460;border-radius:6px;padding:8px 12px;font-size:11px;line-height:1.8;pointer-events:none;z-index:90;display:none}
+#legend .leg-row{display:flex;align-items:center;gap:6px}
+#legend .leg-dot{width:10px;height:10px;border-radius:50%;flex-shrink:0}
+#legend .leg-line{width:18px;height:0;border-top:2.5px solid;flex-shrink:0}
 </style>
 </head>
 <body>
@@ -40,14 +43,24 @@ button:disabled{opacity:0.4;cursor:default}
   <label>Open Log<input type="file" id="file-input" accept=".jsonl"></label>
   <span id="info">No file loaded</span>
   <label style="display:flex;align-items:center;gap:4px;font-size:12px;color:#a0a0c0;background:none;padding:0">
-    Spacing <input id="hspacing" type="range" min="20" max="400" value="160" style="width:100px;vertical-align:middle">
-    <span id="hspacing-val" style="min-width:32px">160</span>
+    X粒度 <input id="xscale" type="range" min="1" max="500" value="100" style="width:120px;vertical-align:middle">
+    <span id="xscale-val" style="min-width:48px">1.00</span> px/tok
+  </label>
+  <label style="display:flex;align-items:center;gap:4px;font-size:12px;color:#a0a0c0;background:none;padding:0;cursor:pointer">
+    <input id="fork-leaf-only" type="checkbox" style="cursor:pointer"> 仅分叉+叶
+  </label>
+  <label style="display:flex;align-items:center;gap:4px;font-size:12px;color:#a0a0c0;background:none;padding:0;cursor:pointer">
+    <input id="uniform-nodes" type="checkbox" style="cursor:pointer"> 等距节点
+  </label>
+  <label style="display:flex;align-items:center;gap:4px;font-size:12px;color:#a0a0c0;background:none;padding:0;cursor:pointer">
+    <input id="isolate-subtrees" type="checkbox" style="cursor:pointer"> 子树隔离
   </label>
 </header>
 <div id="main">
   <div id="tree-panel">
     <svg id="tree-svg"></svg>
     <div id="tooltip"></div>
+    <div id="legend"></div>
   </div>
   <div id="side">
     <div id="stats">Load a .jsonl log to begin.</div>
@@ -138,6 +151,22 @@ function parseLog(text, name) {
   checkpoints = new Map();
   currentReq = -1;
   buildCheckpoints();
+
+  // Auto-fit X-scale: compute max token depth from the final tree state
+  // and set px/token so the tree roughly fills the panel width.
+  const maxDepth = Math.max(1, ...Array.from(treeNodes.values()).map(n => {
+    let d = 0, cur = n;
+    while (cur && cur.id !== ROOT_ID) {
+      d += cur.pageLen || 0;
+      cur = treeNodes.get(cur.pid);
+    }
+    return d;
+  }));
+  const panelW = document.getElementById("tree-panel").clientWidth || 1200;
+  const autoScale = Math.max(1, Math.min(500, Math.round((panelW * 0.7) / maxDepth * 100)));
+  document.getElementById("xscale").value = autoScale;
+  document.getElementById("xscale-val").textContent = (autoScale / 100).toFixed(2);
+
   // buildCheckpoints leaves tree in final state; restore to empty.
   deserializeTree(checkpoints.get(-1));
   enableButtons(true);
@@ -232,6 +261,31 @@ function applyEvent(ev, track, reqIdx) {
     case "ME": {
       const n = treeNodes.get(ev.id);
       if (n) n.mamba = false;
+      break;
+    }
+    case "SP": {
+      // Node split: old node (oid) → prefix (pid) + suffix (sid).
+      // Suffix keeps old id; prefix gets a new id inserted between parent and suffix.
+      const old = treeNodes.get(ev.oid);
+      if (old) {
+        const oldParent = treeNodes.get(old.pid);
+        // Create prefix node (new id, replaces old in parent)
+        const prefix = {
+          id: ev.pid, pid: old.pid, pageLen: ev.plen,
+          children: new Set([ev.sid]),
+          ac: old.ac, la: old.la, mamba: false, crf: null,
+          state: track ? old.state : "", dead: false,
+        };
+        treeNodes.set(ev.pid, prefix);
+        if (oldParent) {
+          oldParent.children.delete(ev.oid);
+          oldParent.children.add(ev.pid);
+        }
+        // Mutate old node into suffix
+        old.pid = ev.pid;
+        old.pageLen = ev.slen;
+        // mamba state stays on suffix (unchanged)
+      }
       break;
     }
     case "E": {
@@ -353,6 +407,7 @@ svg.call(zoom);
 
 function render() {
   updateTree();
+  updateLegend();
   updateStats();
   updateChart();
   updateProgress();
@@ -363,6 +418,37 @@ function updateProgress() {
   const pct = total > 1 ? (currentReq / (total - 1)) * 100 : 0;
   document.getElementById("progress-bar").style.width = pct + "%";
   document.getElementById("step-label").textContent = `${currentReq + 1} / ${total}`;
+}
+
+function updateLegend() {
+  const el = document.getElementById("legend");
+  if (currentReq < 0) { el.style.display = "none"; return; }
+  const isForkLeaf = document.getElementById("fork-leaf-only").checked;
+
+  const dot = (color, label) =>
+    `<div class="leg-row"><span class="leg-dot" style="background:${color}"></span>${label}</div>`;
+  const line = (color, style, label) =>
+    `<div class="leg-row"><span class="leg-line" style="border-color:${color};${style}"></span>${label}</div>`;
+
+  let html = "<b style='color:#a0a0c0;margin-bottom:2px;display:block'>节点</b>";
+  if (isForkLeaf) {
+    html += dot("#5bc0de", "分叉点");
+    html += dot("#e8a838", "叶子");
+  } else {
+    html += dot("#6a7080", "普通节点");
+    html += dot("#f0a040", "Mamba 状态");
+  }
+  html += dot("#2a2a35", "已淘汰 (ghost)");
+
+  html += "<b style='color:#a0a0c0;margin:4px 0 2px;display:block'>边</b>";
+  html += line("#4ecf4e", "", "Cache hit");
+  html += line("#4e9cf0", "", "新插入");
+  html += line("#e94560", "", "刚淘汰");
+  html += line("#333", "border-style:dashed", "旧 ghost");
+  html += line("#445", "", "默认");
+
+  el.innerHTML = html;
+  el.style.display = "block";
 }
 
 // ── Tree layout & draw ─────────────────────────────────────────────────
@@ -413,41 +499,106 @@ function buildHierarchy() {
     if (obj.children.length === 0) obj.children = null;
     return obj;
   }
-  return d3.hierarchy(recurse(ROOT_ID), d => d.children);
+
+  const rawRoot = recurse(ROOT_ID);
+  if (!rawRoot) return null;
+
+  // Compute _tokenDepth and _subtreeLeaves (leaf count) for each node.
+  // _subtreeLeaves is used to sort children so larger subtrees stay
+  // together, reducing edge crossings.
+  function computeDepthAndSize(node, parentDepth) {
+    const ownLen = node.data.pageLen || 0;
+    node.data._tokenDepth = parentDepth + ownLen;
+    if (!node.children || node.children.length === 0) {
+      node.data._subtreeLeaves = 1;
+      return;
+    }
+    for (const child of node.children) {
+      computeDepthAndSize(child, node.data._tokenDepth);
+    }
+    // Sort children: largest subtree first → keeps heavy branches
+    // contiguous, preventing light branches from slicing through.
+    node.children.sort((a, b) => (b.data._subtreeLeaves || 1) - (a.data._subtreeLeaves || 1));
+    node.data._subtreeLeaves = node.children.reduce((s, c) => s + (c.data._subtreeLeaves || 1), 0);
+  }
+  computeDepthAndSize(rawRoot, 0);
+
+  // Optional: collapse to show only fork points (>1 child) and leaves.
+  // Chain nodes (exactly 1 child, not root) are skipped; their token
+  // lengths are accumulated so the surviving child's link spans the
+  // full distance on the X-axis.
+  if (document.getElementById("fork-leaf-only").checked) {
+    function collapseChains(node) {
+      if (!node.children) return;
+      // Recurse first so children are already collapsed
+      for (const child of node.children) collapseChains(child);
+      // Now collapse single-child chain nodes among our children
+      const newChildren = [];
+      for (let child of node.children) {
+        while (child.children && child.children.length === 1
+               && child.data.id !== ROOT_ID) {
+          child = child.children[0];
+        }
+        newChildren.push(child);
+      }
+      node.children = newChildren.length > 0 ? newChildren : null;
+    }
+    collapseChains(rawRoot);
+  }
+
+  return d3.hierarchy(rawRoot, d => d.children);
 }
 
+const forkLeafToggle = document.getElementById("fork-leaf-only");
+
 function nodeColor(n) {
-  // Just evicted this step → red
-  if (n.state === "evicted") return "#e94560";
-  // Dead ghost from previous steps → very dark gray
+  // Dead/ghost → very dark gray
   if (n.dead) return "#2a2a35";
-  // Live states
-  if (n.state === "hit") return "#4ecf4e";
-  if (n.state === "new") return "#4e9cf0";
+  // Fork+leaf mode: distinguish fork (cyan) vs leaf (amber), overrides mamba
+  if (forkLeafToggle.checked && n.id !== ROOT_ID) {
+    return n.children.size > 1 ? "#5bc0de" : "#e8a838";
+  }
   // Mamba state → orange fill
   if (n.mamba) return "#f0a040";
-  // Live default → slightly bright gray
+  // Default → gray (hit/evict activity is shown on links, not nodes)
   return "#6a7080";
 }
 function nodeStroke(n) {
-  if (n.state === "evicted") return "#ff6080";
   if (n.dead) return "#1e1e28";
-  // Mamba ring: always show orange border when node carries mamba state,
-  // even if the fill is green (hit) or blue (new)
+  if (forkLeafToggle.checked && n.id !== ROOT_ID) {
+    return n.children.size > 1 ? "#3a9fc0" : "#c08020";
+  }
   if (n.mamba) return "#f0a040";
   return "#3a4050";
 }
 function nodeStrokeWidth(n) {
-  // Thicker ring for mamba nodes so the orange border is clearly visible
   if (!n.dead && n.mamba) return 2.5;
   return 1.5;
 }
 function nodeOpacity(n) {
-  if (n.dead && n.state !== "evicted") return 0.45;
+  if (n.dead) return 0.45;
   return 1.0;
 }
-function linkClass(d) {
-  return d.target.data.data.dead ? "link-dead" : "link";
+
+// ── Link styling: hit → green, new → blue, evict → red ───────────────
+function linkStroke(d) {
+  const t = d.target.data.data;
+  if (t.dead) return t.state === "evicted" ? "#e94560" : "#333";
+  if (t.state === "hit") return "#4ecf4e";
+  if (t.state === "new") return "#4e9cf0";
+  return "#445";
+}
+function linkWidth(d) {
+  const t = d.target.data.data;
+  if (t.dead && t.state === "evicted") return 2.2;
+  if (t.state === "hit" || t.state === "new") return 2.5;
+  if (t.dead) return 0.8;
+  return 1.2;
+}
+function linkDash(d) {
+  const t = d.target.data.data;
+  if (t.dead && t.state !== "evicted") return "3,3";
+  return null;
 }
 
 function updateTree() {
@@ -460,25 +611,60 @@ function updateTree() {
 
   const nodeCount = hier.descendants().length;
 
-  // Adaptive sizing
-  const nodeH = Math.max(14, Math.min(28, H / (nodeCount + 1)));
-  const hSpacing = parseInt(document.getElementById("hspacing").value) || 160;
-  const treeLayout = d3.tree().nodeSize([nodeH, hSpacing]);
-  treeLayout(hier);
+  // ── Vertical layout ──────────────────────────────────────────────────
+  if (document.getElementById("isolate-subtrees").checked) {
+    // DFS layout: each leaf gets its own vertical slot. Subtrees never
+    // invade each other, but uses more vertical space.
+    const nodeH = Math.max(14, Math.min(28, H / (hier.leaves().length + 1)));
+    let leafSlot = 0;
+    (function assignY(node) {
+      if (!node.children || node.children.length === 0) {
+        node.x = leafSlot * nodeH;
+        leafSlot++;
+        return;
+      }
+      for (const ch of node.children) assignY(ch);
+      node.x = (node.children[0].x + node.children[node.children.length - 1].x) / 2;
+    })(hier);
+  } else {
+    // Compact d3.tree layout: fits more nodes on screen, subtrees may
+    // overlap when there are many branches.
+    const nodeH = Math.max(14, Math.min(28, H / (nodeCount + 1)));
+    d3.tree().nodeSize([nodeH, 100])(hier);
+  }
 
+  // Horizontal position: tokenDepth × scale, or uniform ranking
+  const scaleVal = parseInt(document.getElementById("xscale").value) / 100;
   const nodes = hier.descendants();
+
+  if (document.getElementById("uniform-nodes").checked) {
+    const depths = [...new Set(nodes.map(d => d.data.data._tokenDepth || 0))].sort((a, b) => a - b);
+    const rankMap = new Map();
+    depths.forEach((v, i) => rankMap.set(v, i));
+    const spacing = scaleVal * 30;
+    for (const d of nodes) {
+      d.y = rankMap.get(d.data.data._tokenDepth || 0) * spacing;
+    }
+  } else {
+    for (const d of nodes) {
+      d.y = (d.data.data._tokenDepth || 0) * scaleVal;
+    }
+  }
+
   const links = hier.links();
 
-  // Links — separate live vs dead for styling
-  const link = gRoot.selectAll("path.link,path.link-dead").data(links, d => {
+  // Links — smooth curves, styled per-link
+  const link = gRoot.selectAll("path.link").data(links, d => {
     const tid = d.target.data.data.id;
     const dead = d.target.data.data.dead;
     return (dead ? "g" : "l") + tid;
   });
   link.exit().remove();
-  const linkEnter = link.enter().append("path");
+  const linkEnter = link.enter().append("path").attr("class", "link");
   link.merge(linkEnter)
-    .attr("class", d => linkClass(d))
+    .attr("stroke", d => linkStroke(d))
+    .attr("stroke-width", d => linkWidth(d))
+    .attr("stroke-dasharray", d => linkDash(d))
     .attr("d", d3.linkHorizontal().x(d => d.y).y(d => d.x));
 
   // Nodes
@@ -506,7 +692,7 @@ function updateTree() {
       .text(d => {
         const n = d.data.data;
         if (n.id === ROOT_ID) return "root";
-        let s = `${n.pageLen}t`;
+        let s = `${n.pageLen}t @${n._tokenDepth || 0}`;
         if (hasCrf) s += ` crf=${(n.crf ?? 0).toFixed(2)}`;
         else s += ` ac=${n.ac}`;
         if (n.dead) s = "X " + s;
@@ -522,8 +708,9 @@ function updateTree() {
   merged
     .on("mouseenter", (ev, d) => {
       const n = d.data.data;
-      let lines = [`id: ${n.id}`, `tokens: ${n.pageLen}`, `access: ${n.ac}`, `last_access: ${n.la}`];
-      if (n.crf !== null) lines.push(`crf: ${n.crf.toFixed(6)}`);
+      let lines = [`id: ${n.id}`, `tokens: ${n.pageLen}`, `depth: ${n._tokenDepth || 0} tokens`];
+      lines.push(`access: ${n.ac}`, `last_access: ${n.la}`);
+      if (n.crf !== null && n.crf !== undefined) lines.push(`crf: ${n.crf.toFixed(6)}`);
       if (n.mamba) lines.push("mamba: yes");
       if (n.dead) lines.push(n.state === "evicted" ? "JUST EVICTED" : `evicted (req #${n.diedAtReq})`);
       else if (n.state) lines.push(`state: ${n.state}`);
@@ -658,9 +845,24 @@ function updateChart() {
   }
 }
 
-// ── Spacing slider ────────────────────────────────────────────────────
-document.getElementById("hspacing").addEventListener("input", e => {
-  document.getElementById("hspacing-val").textContent = e.target.value;
+// ── X-scale slider ────────────────────────────────────────────────────
+document.getElementById("xscale").addEventListener("input", e => {
+  document.getElementById("xscale-val").textContent = (parseInt(e.target.value) / 100).toFixed(2);
+  if (currentReq >= 0) render();
+});
+
+// ── Fork+leaf toggle ──────────────────────────────────────────────────
+document.getElementById("fork-leaf-only").addEventListener("change", () => {
+  if (currentReq >= 0) render();
+});
+
+// ── Uniform-nodes toggle ──────────────────────────────────────────────
+document.getElementById("uniform-nodes").addEventListener("change", () => {
+  if (currentReq >= 0) render();
+});
+
+// ── Isolate-subtrees toggle ───────────────────────────────────────────
+document.getElementById("isolate-subtrees").addEventListener("change", () => {
   if (currentReq >= 0) render();
 });
 
