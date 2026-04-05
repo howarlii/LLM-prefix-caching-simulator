@@ -102,6 +102,13 @@ class KVCacheSimulator:
 
     def process_token_ids(self, token_ids: List[int]) -> RequestTrace:
         pages = tokens_to_pages(token_ids, self.page_size)
+        # Drop trailing partial page when the strategy requires full pages only.
+        if (
+            self.strategy.drop_partial_last_page
+            and len(pages) > 1
+            and len(pages[-1]) < self.page_size
+        ):
+            pages = pages[:-1]
         hit_pages, hit_tokens, kv_only_hit_pages, total_tokens, turn_hit_tokens, new_nodes, matched_nodes = (
             self.tree.simulate_request(pages)
         )

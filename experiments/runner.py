@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import csv
 import json
+import re
 import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, cast
@@ -43,14 +44,24 @@ def strategy_from_name(name: str) -> EvictionStrategy:
     if n == "fifo":
         return FIFOStrategy()
     if n == "marconi" or n.startswith("marconi_"):
-        # Optional alpha suffix: "marconi_2.0" → alpha=2.0
-        parts = n.split("_", 1)
-        alpha = float(parts[1]) if len(parts) == 2 else 1.0
-        return MarconiStrategy(alpha=alpha)
+        # Optional alpha suffix: "marconi_a2.0" → alpha=2.0
+        m = re.search(r"_a([\d.]+)", n)
+        kwargs = {"alpha": float(m.group(1))} if m else {}
+        return MarconiStrategy(**kwargs)
+    # Marconi2 ablation variants: marconi2_e{0|1}_mn{0|1}[_a<float>]
+    # e0 = root-relative evict (original), e1 = checkpoint-relative evict (new)
+    # mn0 = no mid-chain mamba, mn1 = mid-chain mamba (new)
+    m2_ablation = re.match(r"^marconi2_e([01])_mn([01])", n)
+    if m2_ablation:
+        use_evict = m2_ablation.group(1) == "1"
+        use_mn = m2_ablation.group(2) == "1"
+        m_alpha = re.search(r"_a([\d.]+)", n[m2_ablation.end():])
+        kwargs = {"alpha": float(m_alpha.group(1))} if m_alpha else {}
+        return Marconi2Strategy(use_checkpoint_relative_evict=use_evict, use_mid_chain_checkpoint=use_mn, **kwargs)
     if n == "marconi2" or n.startswith("marconi2_"):
-        parts = n.split("_", 1)
-        alpha = float(parts[1]) if len(parts) == 2 else 1.0
-        return Marconi2Strategy(alpha=alpha)
+        m = re.search(r"_a([\d.]+)", n)
+        kwargs = {"alpha": float(m.group(1))} if m else {}
+        return Marconi2Strategy(**kwargs)
     if n == "crf_decoupling" or n.startswith("crf_decoupling_"):
         # Optional lambda suffix: "crf_decoupling_0.01" → lambda_decay=0.01
         parts = n.split("_", 2)

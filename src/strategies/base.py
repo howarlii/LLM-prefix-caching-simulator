@@ -60,6 +60,14 @@ class EvictionStrategy(ABC):
         """
         return
 
+    @property
+    def drop_partial_last_page(self) -> bool:
+        """If ``True``, the simulator will discard the last page of a request
+        when it contains fewer tokens than ``page_size``.  The preceding full
+        page becomes the request's turn-end boundary.  Default: ``False``.
+        """
+        return False
+
     def on_new_nodes_inserted(
         self, tree: RadixTree, new_nodes: List[RadixNode]
     ) -> None:

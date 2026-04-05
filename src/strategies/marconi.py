@@ -76,6 +76,10 @@ class MarconiStrategy(EvictionStrategy):
     def __init__(self, alpha: float = 1.5) -> None:
         self.alpha = alpha
 
+    @property
+    def drop_partial_last_page(self) -> bool:
+        return True
+
     # ------------------------------------------------------------------
     # Admission
     # ------------------------------------------------------------------

@@ -26,6 +26,16 @@ from src.strategies.base import EvictOp, EvictionStrategy
 _MIN_CHAIN_TOKENS_FOR_MID_CHECKPOINT = 2048
 
 
+def _depth_tokens(node: RadixNode) -> int:
+    """Total number of tokens on the path from root down to *node* (inclusive)."""
+    d = 0
+    n: RadixNode | None = node
+    while n is not None and n.parent is not None:
+        d += n.num_tokens
+        n = n.parent
+    return d
+
+
 def _depth_tokens_from_checkpoint(node: RadixNode) -> int:
     """Token distance from the nearest ancestor with Mamba state (or root) to *node* (inclusive)."""
     d = node.num_tokens
@@ -59,10 +69,27 @@ class Marconi2Strategy(EvictionStrategy):
     ----------
     alpha:
         Weight for the FLOP-efficiency term in the eviction score.
+    use_checkpoint_relative_evict:
+        If True (default), measure FLOP depth from nearest mamba checkpoint
+        rather than from root.  Setting False reverts to Marconi-v1 scoring.
+    use_mid_chain_checkpoint:
+        If True (default), place a mid-chain mamba state at ~55% of long
+        new chains.  Setting False disables this behaviour.
     """
 
-    def __init__(self, alpha: float = 1.5) -> None:
+    def __init__(
+        self,
+        alpha: float = 1.5,
+        use_checkpoint_relative_evict: bool = True,
+        use_mid_chain_checkpoint: bool = True,
+    ) -> None:
         self.alpha = alpha
+        self.use_checkpoint_relative_evict = use_checkpoint_relative_evict
+        self.use_mid_chain_checkpoint = use_mid_chain_checkpoint
+
+    @property
+    def drop_partial_last_page(self) -> bool:
+        return True
 
     # ------------------------------------------------------------------
     # Unified scoring
@@ -90,7 +117,8 @@ class Marconi2Strategy(EvictionStrategy):
             return []
 
         recencies = [n.last_access for n, _ in all_nodes]
-        depths = [_depth_tokens_from_checkpoint(n) for n, _ in all_nodes]
+        depth_fn = _depth_tokens_from_checkpoint if self.use_checkpoint_relative_evict else _depth_tokens
+        depths = [depth_fn(n) for n, _ in all_nodes]
 
         min_r, max_r = min(recencies), max(recencies)
         min_d, max_d = min(depths), max(depths)
@@ -139,6 +167,9 @@ class Marconi2Strategy(EvictionStrategy):
                 tree.set_mamba_state(parent)
 
         # --- Mid-chain checkpoint at ~55% ---
+        if not self.use_mid_chain_checkpoint:
+            return
+
         # Compute token gap from last checkpoint/root to the start of new nodes.
         anchor = new_nodes[0].parent
         tokens_before_chain = 0
