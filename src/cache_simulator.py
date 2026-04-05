@@ -74,6 +74,9 @@ class KVCacheSimulator:
         to full-attention KV cache.  ``0`` (default) = pure full-attention
         mode; no Mamba state is stored and cache hits are not gated by Mamba
         state availability.
+    logger:
+        Optional :class:`~viz.tree_logger.TreeLogger`.  Passed through to the
+        :class:`RadixTree` which handles all event recording.
     """
 
     def __init__(
@@ -82,13 +85,16 @@ class KVCacheSimulator:
         strategy: EvictionStrategy,
         capacity_tokens: Optional[int] = None,
         mamba_state_token_equiv: int = 0,
+        logger: object = None,
     ) -> None:
         self.page_size = page_size
         self.strategy = strategy
         self.capacity_tokens: Optional[int] = capacity_tokens
         self.mamba_state_token_equiv = mamba_state_token_equiv
+        self.logger = logger
         self.tree = RadixTree(mamba_state_token_equiv=mamba_state_token_equiv)
         self.state = SimulationState()
+        self._request_count = 0
 
     def reset(self) -> None:
         self.tree = RadixTree(mamba_state_token_equiv=self.mamba_state_token_equiv)
@@ -100,17 +106,46 @@ class KVCacheSimulator:
             self.tree.simulate_request(pages)
         )
 
-        # Notify the strategy about cache hits (for CRF / metadata updates).
+        log = self.logger
+        rid = self._request_count
+        self._request_count += 1
+
+        # 1. Notify strategy about cache hits (updates CRF etc.)
         if matched_nodes:
             self.strategy.on_cache_hit(self.tree, matched_nodes)
 
-        # Admission: for each newly inserted node, ask the strategy whether to
-        # store a Mamba state.  Skipped entirely in pure full-attention mode.
+        # 2. Admission: in hybrid mode, ask strategy whether to store Mamba state.
+        #    Track which nodes got mamba state for logging.
+        mamba_admitted: List = []
         if self.mamba_state_token_equiv > 0:
             for node in new_nodes:
                 if self.strategy.admit_mamba_state(node):
                     self.tree.set_mamba_state(node)
+                    mamba_admitted.append(node)
+
+        # 3. Notify strategy about new nodes (CRF init, fork detection, etc.).
+        #    This may also set mamba state (e.g. Marconi fork-point parent).
+        mamba_before = {id(n) for n in self.tree.nodes_with_mamba_state()} if log and new_nodes else set()
+        if new_nodes:
             self.strategy.on_new_nodes_inserted(self.tree, new_nodes)
+
+        # 4. Log AFTER all strategy hooks, so CRF values are up-to-date.
+        if log:
+            log.request_start(rid, self.tree.clock, total_tokens)
+            # Hits — CRF has been updated by on_cache_hit already
+            for n in matched_nodes:
+                log.hit(n)
+            # Inserts
+            for n in new_nodes:
+                log.insert(n)
+            # Mamba admissions from step 2
+            for n in mamba_admitted:
+                log.mamba_set(n)
+            # Mamba admissions from step 3 (on_new_nodes_inserted)
+            if new_nodes:
+                for n in self.tree.nodes_with_mamba_state():
+                    if id(n) not in mamba_before and n not in mamba_admitted:
+                        log.mamba_set(n)
 
         trace = RequestTrace(
             input_tokens=total_tokens,
@@ -121,25 +156,32 @@ class KVCacheSimulator:
             kv_only_hit_pages=kv_only_hit_pages,
         )
         self._evict_until_fit()
-        self.state.record_trace(trace, self.tree.total_cached_tokens())
+
+        cached = self.tree.total_cached_tokens()
+        if log:
+            log.request_end(rid, hit_tokens, total_tokens - hit_tokens, cached)
+
+        self.state.record_trace(trace, cached)
         return trace
 
     def _evict_until_fit(self) -> None:
         if self.capacity_tokens is None:
             return
+        log = self.logger
         cap = self.capacity_tokens
         while self.tree.total_cached_tokens() > cap:
-            # Try Mamba-state-only evictions first: cheaper to demote a node
-            # (keep its KV pages, drop its SSM state) than to remove it entirely.
-            mamba_candidates = self.strategy.select_mamba_state_evictions(self.tree, 1)
-            if mamba_candidates:
-                self.tree.evict_mamba_state(mamba_candidates[0])
-                continue
-            # Fall back to full node eviction.
-            node_candidates = self.strategy.select_nodes(self.tree, 1)
-            if not node_candidates:
+            action = self.strategy.select_eviction(self.tree)
+            if action is None:
                 break
-            self.tree.remove_leaf(node_candidates[0])
+            node, op = action
+            if op == "mamba":
+                self.tree.evict_mamba_state(node)
+                if log:
+                    log.mamba_evict(node)
+            else:
+                removed = self.tree.remove_leaf(node)
+                if log and removed:
+                    log.evict(removed)
 
 
 class MultiTierCacheSimulator:

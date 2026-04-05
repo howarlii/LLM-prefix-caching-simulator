@@ -27,18 +27,18 @@ def main() -> None:
     p.add_argument("--dataset", default="loogle",
                    help="loogle | narrativeqa | sharegpt | sharegpt_90k_raw | mooncake_toolagent | mooncake_conversation")
     p.add_argument("--page-size", type=int, default=32)
-    p.add_argument("--ordering", default="original",
+    p.add_argument("--ordering", default="random",
                    help="original | min_distance | max_distance | random")
     p.add_argument("--strategy", default="lru",
                    help="lru | lfu | fifo | marconi")
-    p.add_argument("--capacity", default="inf",
+    p.add_argument("--capacity", default="160",
                    help="Cache capacity in GB (e.g. 20) or inf")
     p.add_argument("--tokenizer", default=DEFAULT_TOKENIZER_NAME)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--tokenize-workers", type=int, default=0)
-    p.add_argument("--max-requests", type=int, default=0,
+    p.add_argument("--max-requests", type=int, default=5000,
                    help="0 = full dataset")
-    p.add_argument("--mamba-state-token-equiv", type=int, default=0,
+    p.add_argument("--mamba-state-token-equiv", type=int, default=1000,
                    help="Token-equivalent cost of one Mamba SSM state (0 = pure attention mode)")
     p.add_argument("--kv-bytes-per-token", type=int, default=0,
                    help="0 = use default from config")

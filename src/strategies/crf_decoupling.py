@@ -12,12 +12,15 @@ two distinct eviction operations:
 
 CRF update on cache hit
 ~~~~~~~~~~~~~~~~~~~~~~~
-On every hit that touches node *n*::
+On every hit that touches node *n* **with a Mamba state**::
 
     crf_new = 1.0 + 2^(-lambda * delta_t) * crf_old
 
 where ``delta_t`` is the time since the last access.  Smaller ``lambda``
 gives more weight to frequency; larger ``lambda`` favours recency.
+
+Nodes without a Mamba state do not maintain CRF scores — they cannot
+save computation on their own, so tracking their popularity is pointless.
 
 The strategy integrates with the existing two-phase eviction loop
 (``select_mamba_state_evictions`` then ``select_nodes``) but compares
@@ -28,20 +31,14 @@ demotion is cheaper than a chain eviction.
 from __future__ import annotations
 
 import math
+import warnings
+from collections import deque
 from typing import List, Optional, Tuple
 
 from src.radix_tree import RadixNode, RadixTree
-from src.strategies.base import EvictionStrategy
+from src.strategies.base import EvictOp, EvictionStrategy
 
-
-def _depth_tokens(node: RadixNode) -> int:
-    """Total tokens from root down to *node* (inclusive)."""
-    d = 0
-    n: Optional[RadixNode] = node
-    while n is not None and n.parent is not None:
-        d += len(n.page)
-        n = n.parent
-    return d
+_DEFAULT_CRF = 2.0
 
 
 def _delta_mamba(node: RadixNode) -> int:
@@ -60,32 +57,37 @@ def _delta_mamba(node: RadixNode) -> int:
 
 
 def _get_crf(node: RadixNode) -> float:
-    return getattr(node, "_crf_value", 1.0)
+    return getattr(node, "_crf_value", _DEFAULT_CRF)
 
 
-def _get_crf_last_access(node: RadixNode) -> float:
-    return getattr(node, "_crf_last_access", 0.0)
+def _get_crf_ts(node: RadixNode) -> int:
+    return getattr(node, "_crf_ts", 0)
 
 
-def _set_crf(node: RadixNode, crf: float, ts: float) -> None:
+def _effective_crf(node: RadixNode, t_now: int, lambda_decay: float) -> float:
+    """Return CRF with time-decay applied up to *t_now*."""
+    stored = _get_crf(node)
+    ts = _get_crf_ts(node)
+    if ts > 0 and t_now > ts:
+        v = math.pow(2, -lambda_decay * (t_now - ts)) * stored
+        _set_crf(node, v, ts)  # update in-place with decay
+    return stored
+
+
+def _set_crf(node: RadixNode, crf: float, ts: int) -> None:
     node._crf_value = crf  # type: ignore[attr-defined]
-    node._crf_last_access = ts  # type: ignore[attr-defined]
+    node._crf_ts = ts  # type: ignore[attr-defined]
 
 
-def _update_crf(node: RadixNode, current_time: float, lambda_decay: float) -> None:
-    """Apply the CRF update formula."""
+def _update_crf(node: RadixNode, ts: int, lambda_decay: float) -> None:
     old_crf = _get_crf(node)
-    old_ts = _get_crf_last_access(node)
+    old_ts = _get_crf_ts(node)
     if old_ts > 0:
-        delta = current_time - old_ts
+        delta = ts - old_ts
         new_crf = 1.0 + math.pow(2, -lambda_decay * delta) * old_crf
     else:
         new_crf = 1.0
-    _set_crf(node, new_crf, current_time)
-
-
-def _init_crf(node: RadixNode, current_time: float) -> None:
-    _set_crf(node, 1.0, current_time)
+    _set_crf(node, new_crf, ts)
 
 
 class CRFDecouplingStrategy(EvictionStrategy):
@@ -103,7 +105,7 @@ class CRFDecouplingStrategy(EvictionStrategy):
 
     def __init__(
         self,
-        lambda_decay: float = 0.001,
+        lambda_decay: float = 0.5,
         c_attn: float = 1.0,
         c_ssm: float = 1.0,
     ) -> None:
@@ -112,22 +114,30 @@ class CRFDecouplingStrategy(EvictionStrategy):
         self.c_ssm = c_ssm
 
     # ------------------------------------------------------------------
-    # CRF bookkeeping
+    # CRF bookkeeping — only for nodes carrying Mamba state
     # ------------------------------------------------------------------
 
     def on_cache_hit(
         self, tree: RadixTree, matched_nodes: List[RadixNode]
     ) -> None:
+        if tree.mamba_state_token_equiv == 0:
+            return
         ts = tree.clock
+        ld = self.lambda_decay
         for node in matched_nodes:
-            _update_crf(node, ts, self.lambda_decay)
+            if node.has_mamba_state:
+                _update_crf(node, ts, ld)
+                break
 
     def on_new_nodes_inserted(
         self, tree: RadixTree, new_nodes: List[RadixNode]
     ) -> None:
+        if tree.mamba_state_token_equiv == 0:
+            return
         ts = tree.clock
         for node in new_nodes:
-            _init_crf(node, ts)
+            if node.has_mamba_state:
+                _set_crf(node, _DEFAULT_CRF, ts)
 
     # ------------------------------------------------------------------
     # Admission
@@ -140,9 +150,9 @@ class CRFDecouplingStrategy(EvictionStrategy):
     # Scoring helpers
     # ------------------------------------------------------------------
 
-    def _score_a(self, node: RadixNode, mamba_token_equiv: int) -> float:
+    def _score_a(self, node: RadixNode, mamba_token_equiv: int, t_now: int) -> float:
         """H_A: value score for dropping only a node's Mamba state."""
-        crf = _get_crf(node)
+        crf = _effective_crf(node, t_now, self.lambda_decay)
         delta = _delta_mamba(node)
         s_m = max(mamba_token_equiv, 1)
         return crf * delta * self.c_ssm / s_m
@@ -163,83 +173,121 @@ class CRFDecouplingStrategy(EvictionStrategy):
             cur = cur.parent
         return chain
 
-    def _score_b(
-        self, chain: List[RadixNode], mamba_token_equiv: int
+    def _score_b_chain(
+        self, chain: List[RadixNode], mamba_token_equiv: int, t_now: int
     ) -> Tuple[float, int]:
         """H_B and S_chain for a chain eviction.
 
-        Returns (score, s_chain_tokens) so the caller can compute per-byte
-        value for cross-operation comparison.
+        CRF is only read from nodes with Mamba state; KV-only nodes in the
+        chain use the default score.
         """
-        max_crf = max(_get_crf(n) for n in chain)
-        chain_tokens = sum(len(n.page) for n in chain)
-        s_chain = chain_tokens
+        max_crf = 0.0
+        has_mamba = False
+        chain_tokens = 0
+        s_chain = 0
         for n in chain:
+            toks = len(n.page)
+            chain_tokens += toks
+            s_chain += toks
             if n.has_mamba_state:
+                has_mamba = True
+                crf = _effective_crf(n, t_now, self.lambda_decay)
+                if crf > max_crf:
+                    max_crf = crf
                 s_chain += mamba_token_equiv
+        if not has_mamba:
+            max_crf = _DEFAULT_CRF
         if s_chain == 0:
             return (float("inf"), 0)
         score = max_crf * chain_tokens * (self.c_attn + self.c_ssm) / s_chain
         return (score, s_chain)
 
     # ------------------------------------------------------------------
-    # Eviction
+    # Unified eviction
     # ------------------------------------------------------------------
 
-    def select_mamba_state_evictions(
-        self, tree: RadixTree, num_states: int
-    ) -> List[RadixNode]:
-        """Operation A: drop Mamba state from the cheapest candidate.
-
-        Before returning, compares against the best Operation B candidate.
-        Returns empty if chain eviction would free memory more cheaply,
-        letting the simulator fall through to ``select_nodes``.
-        """
+    def select_eviction(
+        self, tree: RadixTree
+    ) -> Optional[Tuple[RadixNode, EvictOp]]:
+        """Unified eviction: compare Operation A (mamba demotion) vs
+        Operation B (chain eviction) and pick the cheapest."""
         mte = tree.mamba_state_token_equiv
-        if mte == 0:
-            return []
+        t_now = tree.clock
 
-        candidates = tree.nodes_with_mamba_state()
-        if not candidates:
-            return []
+        # Single tree traversal: collect mamba-state candidates and leaves.
+        mamba_candidates: List[RadixNode] = []
+        leaves: List[RadixNode] = []
+        q: deque[RadixNode] = deque(tree.root.children.values())
+        while q:
+            n = q.popleft()
+            if n.has_mamba_state:
+                mamba_candidates.append(n)
+            if n.is_leaf():
+                leaves.append(n)
+            else:
+                q.extend(n.children.values())
 
-        # Best Operation A
-        best_a = min(candidates, key=lambda n: self._score_a(n, mte))
-        score_a = self._score_a(best_a, mte)
-
-        # Compare against best Operation B
-        leaves = tree.leaf_nodes()
-        if leaves:
-            best_b_score = float("inf")
-            best_b_s_chain = 0
-            for leaf in leaves:
-                chain = self._compute_chain(leaf)
-                sb, sc = self._score_b(chain, mte)
-                if sb < best_b_score:
-                    best_b_score = sb
-                    best_b_s_chain = sc
-
+        # Best Operation A: mamba-state demotion (non-branching nodes only)
+        best_a: Optional[RadixNode] = None
+        best_a_value = float("inf")
+        if mte > 0:
+            valid = [n for n in mamba_candidates if len(n.children) <= 1]
+            if not valid and mamba_candidates:
+                warnings.warn(
+                    "CRFDecoupling: all mamba-state candidates are branching "
+                    "points (>1 child); skipping mamba-state-only eviction.",
+                    stacklevel=2,
+                )
             s_m = max(mte, 1)
-            value_a = score_a / s_m
-            value_b = best_b_score / max(best_b_s_chain, 1) if best_b_s_chain > 0 else float("inf")
+            for n in valid:
+                score = self._score_a(n, mte, t_now)
+                value = score / s_m
+                if value < best_a_value:
+                    best_a_value = value
+                    best_a = n
 
-            if value_b < value_a:
-                # Chain eviction is cheaper per unit — skip mamba eviction
-                return []
+        # Best Operation B: chain eviction
+        best_b_leaf: Optional[RadixNode] = None
+        best_b_value = float("inf")
+        for leaf in leaves:
+            chain = self._compute_chain(leaf)
+            sb, sc = self._score_b_chain(chain, mte, t_now)
+            value = sb / max(sc, 1)
+            if value < best_b_value:
+                best_b_value = value
+                best_b_leaf = leaf
 
-        return [best_a]
+        # Pick the cheapest
+        if best_a is not None and best_a_value <= best_b_value:
+            return (best_a, "mamba")
+        if best_b_leaf is not None:
+            return (best_b_leaf, "leaf")
+        return None
 
     def select_nodes(self, tree: RadixTree, num_nodes: int) -> List[RadixNode]:
-        """Operation B: evict the leaf whose chain has the lowest score."""
+        """Fallback for non-hybrid mode: chain eviction only."""
         leaves = tree.leaf_nodes()
         if not leaves:
             return []
 
         mte = tree.mamba_state_token_equiv
+        t_now = tree.clock
+
+        if num_nodes == 1:
+            best_leaf: Optional[RadixNode] = None
+            best_score = float("inf")
+            for leaf in leaves:
+                chain = self._compute_chain(leaf)
+                sb, _ = self._score_b_chain(chain, mte, t_now)
+                if sb < best_score:
+                    best_score = sb
+                    best_leaf = leaf
+            return [best_leaf] if best_leaf is not None else []
+
         scored: List[Tuple[float, RadixNode]] = []
         for leaf in leaves:
             chain = self._compute_chain(leaf)
-            sb, _ = self._score_b(chain, mte)
+            sb, _ = self._score_b_chain(chain, mte, t_now)
             scored.append((sb, leaf))
 
         scored.sort(key=lambda x: x[0])

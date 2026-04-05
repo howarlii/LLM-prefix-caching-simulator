@@ -3,25 +3,36 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING, List
+from typing import TYPE_CHECKING, List, Literal, Optional, Tuple
 
 if TYPE_CHECKING:
     from src.radix_tree import RadixNode, RadixTree
+
+EvictOp = Literal["mamba", "leaf"]
 
 
 class EvictionStrategy(ABC):
     """Decides which cached pages (tree nodes) to evict and which to admit.
 
+    Eviction
+    --------
+    ``select_eviction``
+        The main entry point called by the simulator when over capacity.
+        Returns ``(node, "mamba")`` to drop only the Mamba state, or
+        ``(node, "leaf")`` to remove the leaf entirely, or ``None`` if
+        nothing can be evicted.
+
+        The default implementation falls back to
+        ``select_mamba_state_evictions`` then ``select_nodes`` (preserving
+        legacy behaviour for simple strategies like LRU/LFU/FIFO).
+        Strategies that want unified scoring (e.g. Marconi) should override
+        ``select_eviction`` directly.
+
     Hybrid-model hooks
     ------------------
     ``admit_mamba_state``
         Called for each newly inserted node; return ``True`` to store a Mamba
-        state at that node.  Default: always admit (store Mamba state for
-        every node).
-    ``select_mamba_state_evictions``
-        Return nodes whose *Mamba state only* should be evicted (KV cache
-        kept).  The simulator tries these before full-node evictions.
-        Default: never evict Mamba states separately.
+        state at that node.  Default: always admit.
     """
 
     @abstractmethod
@@ -49,11 +60,29 @@ class EvictionStrategy(ABC):
         """Return up to ``num_states`` nodes from which to evict *only* the
         Mamba state (the KV cache pages are kept in place).
 
-        The simulator calls this *before* ``select_nodes`` when capacity is
-        exceeded, so strategies can choose to demote nodes (KV-only) rather
-        than dropping them entirely.  Default: return empty list (never demote).
+        Default: return empty list (never demote).
         """
         return []
+
+    def select_eviction(
+        self, tree: RadixTree
+    ) -> Optional[Tuple[RadixNode, EvictOp]]:
+        """Pick the single best eviction action.
+
+        Returns ``(node, "mamba")`` to drop only the Mamba state, or
+        ``(node, "leaf")`` to remove the leaf entirely, or ``None``.
+
+        Default: try ``select_mamba_state_evictions`` first, then
+        ``select_nodes`` (legacy two-phase behaviour for simple strategies).
+        Override this for unified scoring.
+        """
+        mamba = self.select_mamba_state_evictions(tree, 1)
+        if mamba:
+            return (mamba[0], "mamba")
+        leaves = self.select_nodes(tree, 1)
+        if leaves:
+            return (leaves[0], "leaf")
+        return None
 
     def on_cache_hit(
         self, tree: RadixTree, matched_nodes: List[RadixNode]

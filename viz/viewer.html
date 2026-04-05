@@ -1,0 +1,671 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Radix Tree Cache Viewer</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:'Menlo','Consolas',monospace;background:#1a1a2e;color:#e0e0e0;overflow:hidden;height:100vh;display:flex;flex-direction:column}
+header{display:flex;align-items:center;gap:12px;padding:8px 16px;background:#16213e;border-bottom:1px solid #0f3460;flex-shrink:0}
+header label{cursor:pointer;padding:4px 12px;background:#0f3460;border-radius:4px;font-size:13px}
+header label:hover{background:#1a4a8a}
+header input[type=file]{display:none}
+#info{font-size:12px;color:#a0a0c0;flex:1}
+#main{display:flex;flex:1;overflow:hidden}
+#tree-panel{flex:1;overflow:hidden;position:relative}
+#tree-svg{width:100%;height:100%}
+#side{width:320px;border-left:1px solid #0f3460;display:flex;flex-direction:column;overflow:hidden;flex-shrink:0}
+#stats{padding:12px;font-size:12px;line-height:1.8;border-bottom:1px solid #0f3460;overflow-y:auto}
+#stats .label{color:#7a7aa0}
+#stats .val{color:#e0e060;font-weight:bold}
+#chart-wrap{flex:1;padding:8px;min-height:0}
+#chart-wrap canvas{width:100%;height:100%}
+footer{display:flex;align-items:center;gap:10px;padding:8px 16px;background:#16213e;border-top:1px solid #0f3460;flex-shrink:0}
+button{background:#0f3460;color:#e0e0e0;border:1px solid #1a4a8a;border-radius:4px;padding:4px 10px;cursor:pointer;font-family:inherit;font-size:13px}
+button:hover{background:#1a4a8a}
+button:disabled{opacity:0.4;cursor:default}
+#progress{flex:1;height:6px;background:#0a0a1a;border-radius:3px;cursor:pointer;position:relative}
+#progress-bar{height:100%;background:#e94560;border-radius:3px;width:0;pointer-events:none}
+#step-label{font-size:12px;min-width:120px;text-align:right}
+#speed{width:60px;text-align:center;font-size:12px;background:#0a0a1a;color:#e0e0e0;border:1px solid #0f3460;border-radius:4px;padding:2px}
+.node circle{}
+.node text{font-size:10px;fill:#c0c0e0}
+.link{fill:none;stroke:#445;stroke-width:1.2px}
+.link-dead{fill:none;stroke:#222;stroke-width:0.8px;stroke-dasharray:3,3}
+#tooltip{position:absolute;background:#16213eee;border:1px solid #0f3460;border-radius:6px;padding:8px 12px;font-size:11px;line-height:1.6;pointer-events:none;display:none;z-index:100;max-width:280px;white-space:pre-line}
+</style>
+</head>
+<body>
+<header>
+  <label>Open Log<input type="file" id="file-input" accept=".jsonl"></label>
+  <span id="info">No file loaded</span>
+  <label style="display:flex;align-items:center;gap:4px;font-size:12px;color:#a0a0c0;background:none;padding:0">
+    Spacing <input id="hspacing" type="range" min="20" max="400" value="160" style="width:100px;vertical-align:middle">
+    <span id="hspacing-val" style="min-width:32px">160</span>
+  </label>
+</header>
+<div id="main">
+  <div id="tree-panel">
+    <svg id="tree-svg"></svg>
+    <div id="tooltip"></div>
+  </div>
+  <div id="side">
+    <div id="stats">Load a .jsonl log to begin.</div>
+    <div id="chart-wrap"><canvas id="chart"></canvas></div>
+  </div>
+</div>
+<footer>
+  <button id="btn-start" disabled title="First">|&#9664;</button>
+  <button id="btn-prev" disabled title="Prev">&laquo;</button>
+  <button id="btn-play" disabled title="Play/Pause">&#9654;</button>
+  <button id="btn-next" disabled title="Next">&raquo;</button>
+  <button id="btn-end" disabled title="Last">&#9654;|</button>
+  <div id="progress"><div id="progress-bar"></div></div>
+  <span id="step-label">-</span>
+  <input id="speed" type="number" value="10" min="1" max="999" title="Requests/sec">
+  <span style="font-size:11px">req/s</span>
+</footer>
+
+<script src="https://d3js.org/d3.v7.min.js"></script>
+<script>
+"use strict";
+
+// ── State ──────────────────────────────────────────────────────────────
+let allEvents = [];          // raw parsed events
+let reqBounds = [];          // [{start, end}] index into allEvents per request
+let currentReq = -1;         // which request we are showing (-1 = before first)
+let playing = false;
+let playTimer = null;
+
+// In-memory tree (rebuilt from events)
+// id -> {id, pid, pageLen, children: Set, ac, la, mamba, crf, state, dead}
+let treeNodes = new Map();
+const ROOT_ID = 0;
+
+// Ghost nodes: recently evicted, kept for visual display
+// id -> {id, pid, pageLen, ac, la, mamba, crf, state, dead, diedAtReq}
+let ghostNodes = new Map();
+const GHOST_KEEP_REQS = 1;  // keep ghosts for N requests after eviction, then remove
+
+// Checkpoints for fast backward nav (every CKPT_INTERVAL requests)
+const CKPT_INTERVAL = 100;
+let checkpoints = new Map(); // reqIndex -> {tree, ghosts}
+
+// Per-request stats for the chart
+let reqStats = [];  // [{hit, miss, cap}]
+let hasCrf = false; // whether any event in the log contains CRF data
+
+// ── File loading ───────────────────────────────────────────────────────
+document.getElementById("file-input").addEventListener("change", e => {
+  const f = e.target.files[0];
+  if (!f) return;
+  document.getElementById("info").textContent = `Loading ${f.name} (${(f.size/1e6).toFixed(1)} MB) …`;
+  const reader = new FileReader();
+  reader.onload = () => parseLog(reader.result, f.name);
+  reader.readAsText(f);
+});
+
+function parseLog(text, name) {
+  const t0 = performance.now();
+  allEvents = [];
+  reqBounds = [];
+  reqStats = [];
+  hasCrf = false;
+  let cur = null;
+  const lines = text.split("\n");
+  for (let i = 0; i < lines.length; i++) {
+    const ln = lines[i];
+    if (!ln) continue;
+    let ev;
+    try { ev = JSON.parse(ln); } catch { continue; }
+    if (!hasCrf && ev.crf !== undefined) hasCrf = true;
+    const idx = allEvents.length;
+    allEvents.push(ev);
+    if (ev.e === "R") {
+      cur = { start: idx, end: idx };
+    } else if (ev.e === "D") {
+      if (cur) { cur.end = idx; reqBounds.push(cur); }
+      reqStats.push({ hit: ev.hit, miss: ev.miss, cap: ev.cap });
+      cur = null;
+    }
+  }
+  const dt = ((performance.now() - t0) / 1000).toFixed(2);
+  document.getElementById("info").textContent =
+    `${name}  |  ${reqBounds.length} requests, ${allEvents.length} events  (parsed in ${dt}s)`;
+
+  // Reset state
+  resetTree();
+  checkpoints = new Map();
+  currentReq = -1;
+  buildCheckpoints();
+  // buildCheckpoints leaves tree in final state; restore to empty.
+  deserializeTree(checkpoints.get(-1));
+  enableButtons(true);
+  jumpTo(0);
+}
+
+function resetTree() {
+  treeNodes = new Map();
+  treeNodes.set(ROOT_ID, mkRoot());
+  ghostNodes = new Map();
+}
+
+function mkRoot() {
+  return { id: ROOT_ID, pid: -1, pageLen: 0, children: new Set(), ac: 0, la: 0, mamba: false, crf: null, state: "", dead: false };
+}
+
+// ── Checkpoints ────────────────────────────────────────────────────────
+function serializeTree() {
+  const t = [];
+  for (const [, n] of treeNodes) t.push({ ...n, children: [...n.children] });
+  const g = [];
+  for (const [, n] of ghostNodes) g.push({ ...n });
+  return { t, g };
+}
+
+function deserializeTree(ckpt) {
+  treeNodes = new Map();
+  for (const n of ckpt.t) treeNodes.set(n.id, { ...n, children: new Set(n.children) });
+  ghostNodes = new Map();
+  if (ckpt.g) for (const n of ckpt.g) ghostNodes.set(n.id, { ...n });
+}
+
+function buildCheckpoints() {
+  resetTree();
+  checkpoints = new Map();
+  checkpoints.set(-1, serializeTree());
+  for (let r = 0; r < reqBounds.length; r++) {
+    applyRequest(r, false);
+    if ((r + 1) % CKPT_INTERVAL === 0) {
+      checkpoints.set(r, serializeTree());
+    }
+  }
+  checkpoints.set(reqBounds.length - 1, serializeTree());
+}
+
+// ── Event application ──────────────────────────────────────────────────
+function clearStates(reqIdx) {
+  for (const n of treeNodes.values()) n.state = "";
+  // Age ghosts: "evicted" (red) → "dead" (dark gray)
+  for (const [id, g] of ghostNodes) {
+    if (g.state === "evicted") g.state = "dead";
+    // Expire old ghosts
+    if (reqIdx - g.diedAtReq > GHOST_KEEP_REQS) ghostNodes.delete(id);
+  }
+}
+
+function applyRequest(reqIdx, trackState) {
+  if (trackState) clearStates(reqIdx);
+  const b = reqBounds[reqIdx];
+  for (let i = b.start; i <= b.end; i++) {
+    applyEvent(allEvents[i], trackState, reqIdx);
+  }
+}
+
+function applyEvent(ev, track, reqIdx) {
+  switch (ev.e) {
+    case "H": {
+      const n = treeNodes.get(ev.id);
+      if (n) {
+        n.ac = ev.ac;
+        n.la = ev.la;
+        if (ev.crf !== undefined) n.crf = ev.crf;
+        if (track) n.state = "hit";
+      }
+      break;
+    }
+    case "I": {
+      // If a ghost exists at this id (re-inserted), remove it
+      ghostNodes.delete(ev.id);
+      const node = { id: ev.id, pid: ev.pid, pageLen: ev.len, children: new Set(),
+                     ac: 1, la: 0, mamba: false, crf: null, state: track ? "new" : "", dead: false };
+      treeNodes.set(ev.id, node);
+      const p = treeNodes.get(ev.pid);
+      if (p) p.children.add(ev.id);
+      break;
+    }
+    case "MS": {
+      const n = treeNodes.get(ev.id);
+      if (n) n.mamba = true;
+      break;
+    }
+    case "ME": {
+      const n = treeNodes.get(ev.id);
+      if (n) n.mamba = false;
+      break;
+    }
+    case "E": {
+      for (const id of ev.ids) {
+        const n = treeNodes.get(id);
+        if (!n) continue;
+        // Save as ghost for visual display
+        if (track) {
+          ghostNodes.set(id, {
+            id: n.id, pid: n.pid, pageLen: n.pageLen,
+            ac: n.ac, la: n.la, mamba: n.mamba, crf: n.crf,
+            state: "evicted", dead: true, diedAtReq: reqIdx,
+          });
+        }
+        const p = treeNodes.get(n.pid);
+        if (p) p.children.delete(id);
+        treeNodes.delete(id);
+      }
+      break;
+    }
+  }
+}
+
+// ── Navigation ─────────────────────────────────────────────────────────
+function jumpTo(target) {
+  target = Math.max(0, Math.min(target, reqBounds.length - 1));
+  if (target === currentReq) { render(); return; }
+
+  // Find nearest checkpoint <= target
+  let best = -1;
+  for (const k of checkpoints.keys()) {
+    if (k < target && k > best) best = k;
+  }
+  // If going forward a small distance, just replay forward
+  if (target > currentReq && target - currentReq < CKPT_INTERVAL) {
+    for (let r = currentReq + 1; r <= target; r++) {
+      applyRequest(r, r === target);
+    }
+  } else {
+    // Restore checkpoint and replay
+    deserializeTree(checkpoints.get(best));
+    for (let r = best + 1; r <= target; r++) {
+      applyRequest(r, r === target);
+    }
+  }
+  currentReq = target;
+  render();
+}
+
+function stepForward() {
+  if (currentReq < reqBounds.length - 1) jumpTo(currentReq + 1);
+  else stopPlay();
+}
+function stepBackward() {
+  if (currentReq > 0) jumpTo(currentReq - 1);
+}
+
+// ── Play / Pause ───────────────────────────────────────────────────────
+function togglePlay() {
+  if (playing) stopPlay(); else startPlay();
+}
+function startPlay() {
+  playing = true;
+  document.getElementById("btn-play").innerHTML = "&#10074;&#10074;";
+  scheduleNext();
+}
+function stopPlay() {
+  playing = false;
+  document.getElementById("btn-play").innerHTML = "&#9654;";
+  if (playTimer) { clearTimeout(playTimer); playTimer = null; }
+}
+function scheduleNext() {
+  const rps = Math.max(1, parseInt(document.getElementById("speed").value) || 10);
+  playTimer = setTimeout(() => {
+    if (!playing) return;
+    stepForward();
+    if (playing) scheduleNext();
+  }, 1000 / rps);
+}
+
+// ── Buttons ────────────────────────────────────────────────────────────
+function enableButtons(on) {
+  for (const id of ["btn-start","btn-prev","btn-play","btn-next","btn-end"])
+    document.getElementById(id).disabled = !on;
+}
+document.getElementById("btn-start").onclick = () => { stopPlay(); jumpTo(0); };
+document.getElementById("btn-prev").onclick  = () => { stopPlay(); stepBackward(); };
+document.getElementById("btn-play").onclick  = togglePlay;
+document.getElementById("btn-next").onclick  = () => { stopPlay(); stepForward(); };
+document.getElementById("btn-end").onclick   = () => { stopPlay(); jumpTo(reqBounds.length - 1); };
+
+// Progress bar click
+document.getElementById("progress").addEventListener("click", e => {
+  const rect = e.currentTarget.getBoundingClientRect();
+  const frac = (e.clientX - rect.left) / rect.width;
+  const target = Math.round(frac * (reqBounds.length - 1));
+  stopPlay();
+  jumpTo(target);
+});
+
+// Keyboard shortcuts
+document.addEventListener("keydown", e => {
+  if (e.target.tagName === "INPUT") return;
+  if (e.key === "ArrowRight") { e.preventDefault(); stopPlay(); stepForward(); }
+  else if (e.key === "ArrowLeft") { e.preventDefault(); stopPlay(); stepBackward(); }
+  else if (e.key === " ") { e.preventDefault(); togglePlay(); }
+  else if (e.key === "Home") { e.preventDefault(); stopPlay(); jumpTo(0); }
+  else if (e.key === "End") { e.preventDefault(); stopPlay(); jumpTo(reqBounds.length - 1); }
+});
+
+// ── Rendering ──────────────────────────────────────────────────────────
+const svg = d3.select("#tree-svg");
+const gRoot = svg.append("g");
+const tooltip = document.getElementById("tooltip");
+
+// Zoom / pan
+const zoom = d3.zoom().scaleExtent([0.05, 6]).on("zoom", e => gRoot.attr("transform", e.transform));
+svg.call(zoom);
+
+function render() {
+  updateTree();
+  updateStats();
+  updateChart();
+  updateProgress();
+}
+
+function updateProgress() {
+  const total = reqBounds.length;
+  const pct = total > 1 ? (currentReq / (total - 1)) * 100 : 0;
+  document.getElementById("progress-bar").style.width = pct + "%";
+  document.getElementById("step-label").textContent = `${currentReq + 1} / ${total}`;
+}
+
+// ── Tree layout & draw ─────────────────────────────────────────────────
+function buildHierarchy() {
+  const root = treeNodes.get(ROOT_ID);
+  if (!root) return null;
+
+  // Group ghosts by parent — parent can be a live node OR another ghost
+  const ghostByParent = new Map();
+  for (const [, g] of ghostNodes) {
+    if (!ghostByParent.has(g.pid)) ghostByParent.set(g.pid, []);
+    ghostByParent.get(g.pid).push(g);
+  }
+
+  // Recursively attach ghost sub-trees (ghost chains: ghost → ghost → …)
+  function ghostSubtree(gid) {
+    const kids = ghostByParent.get(gid);
+    if (!kids || kids.length === 0) return null;
+    return kids.map(g => {
+      const obj = { data: g, children: [] };
+      const sub = ghostSubtree(g.id);
+      if (sub) obj.children = sub;
+      if (obj.children.length === 0) obj.children = null;
+      return obj;
+    });
+  }
+
+  function recurse(id) {
+    const n = treeNodes.get(id);
+    if (!n) return null;
+    const obj = { data: n, children: [] };
+    // Live children
+    for (const cid of n.children) {
+      const ch = recurse(cid);
+      if (ch) obj.children.push(ch);
+    }
+    // Ghost children (evicted nodes, visual only) — includes full ghost chains
+    const ghosts = ghostByParent.get(id);
+    if (ghosts) {
+      for (const g of ghosts) {
+        const gObj = { data: g, children: [] };
+        const sub = ghostSubtree(g.id);
+        if (sub) gObj.children = sub;
+        if (gObj.children.length === 0) gObj.children = null;
+        obj.children.push(gObj);
+      }
+    }
+    if (obj.children.length === 0) obj.children = null;
+    return obj;
+  }
+  return d3.hierarchy(recurse(ROOT_ID), d => d.children);
+}
+
+function nodeColor(n) {
+  // Just evicted this step → red
+  if (n.state === "evicted") return "#e94560";
+  // Dead ghost from previous steps → very dark gray
+  if (n.dead) return "#2a2a35";
+  // Live states
+  if (n.state === "hit") return "#4ecf4e";
+  if (n.state === "new") return "#4e9cf0";
+  // Mamba state → orange fill
+  if (n.mamba) return "#f0a040";
+  // Live default → slightly bright gray
+  return "#6a7080";
+}
+function nodeStroke(n) {
+  if (n.state === "evicted") return "#ff6080";
+  if (n.dead) return "#1e1e28";
+  // Mamba ring: always show orange border when node carries mamba state,
+  // even if the fill is green (hit) or blue (new)
+  if (n.mamba) return "#f0a040";
+  return "#3a4050";
+}
+function nodeStrokeWidth(n) {
+  // Thicker ring for mamba nodes so the orange border is clearly visible
+  if (!n.dead && n.mamba) return 2.5;
+  return 1.5;
+}
+function nodeOpacity(n) {
+  if (n.dead && n.state !== "evicted") return 0.45;
+  return 1.0;
+}
+function linkClass(d) {
+  return d.target.data.data.dead ? "link-dead" : "link";
+}
+
+function updateTree() {
+  const panel = document.getElementById("tree-panel");
+  const W = panel.clientWidth;
+  const H = panel.clientHeight;
+
+  const hier = buildHierarchy();
+  if (!hier) { gRoot.selectAll("*").remove(); return; }
+
+  const nodeCount = hier.descendants().length;
+
+  // Adaptive sizing
+  const nodeH = Math.max(14, Math.min(28, H / (nodeCount + 1)));
+  const hSpacing = parseInt(document.getElementById("hspacing").value) || 160;
+  const treeLayout = d3.tree().nodeSize([nodeH, hSpacing]);
+  treeLayout(hier);
+
+  const nodes = hier.descendants();
+  const links = hier.links();
+
+  // Links — separate live vs dead for styling
+  const link = gRoot.selectAll("path.link,path.link-dead").data(links, d => {
+    const tid = d.target.data.data.id;
+    const dead = d.target.data.data.dead;
+    return (dead ? "g" : "l") + tid;
+  });
+  link.exit().remove();
+  const linkEnter = link.enter().append("path");
+  link.merge(linkEnter)
+    .attr("class", d => linkClass(d))
+    .attr("d", d3.linkHorizontal().x(d => d.y).y(d => d.x));
+
+  // Nodes
+  const node = gRoot.selectAll("g.node").data(nodes, d => {
+    const n = d.data.data;
+    return (n.dead ? "g" : "l") + n.id;
+  });
+  node.exit().remove();
+  const nodeEnter = node.enter().append("g").attr("class", "node");
+  nodeEnter.append("circle");
+  nodeEnter.append("text").attr("dy", "0.35em").attr("x", 10).attr("text-anchor", "start");
+
+  const merged = node.merge(nodeEnter);
+  merged.attr("transform", d => `translate(${d.y},${d.x})`);
+  merged.select("circle")
+    .attr("r", d => d.data.data.id === ROOT_ID ? 4 : Math.max(3, Math.min(7, d.data.data.pageLen / 8)))
+    .attr("fill", d => nodeColor(d.data.data))
+    .attr("stroke", d => nodeStroke(d.data.data))
+    .attr("stroke-width", d => nodeStrokeWidth(d.data.data))
+    .attr("opacity", d => nodeOpacity(d.data.data));
+
+  // Labels: show for small trees; hide for large ones to keep rendering fast
+  if (nodeCount < 500) {
+    merged.select("text")
+      .text(d => {
+        const n = d.data.data;
+        if (n.id === ROOT_ID) return "root";
+        let s = `${n.pageLen}t`;
+        if (hasCrf) s += ` crf=${(n.crf ?? 0).toFixed(2)}`;
+        else s += ` ac=${n.ac}`;
+        if (n.dead) s = "X " + s;
+        return s;
+      })
+      .attr("fill", d => d.data.data.dead ? "#444" : "#c0c0e0")
+      .style("display", null);
+  } else {
+    merged.select("text").style("display", "none");
+  }
+
+  // Tooltip on hover
+  merged
+    .on("mouseenter", (ev, d) => {
+      const n = d.data.data;
+      let lines = [`id: ${n.id}`, `tokens: ${n.pageLen}`, `access: ${n.ac}`, `last_access: ${n.la}`];
+      if (n.crf !== null) lines.push(`crf: ${n.crf.toFixed(6)}`);
+      if (n.mamba) lines.push("mamba: yes");
+      if (n.dead) lines.push(n.state === "evicted" ? "JUST EVICTED" : `evicted (req #${n.diedAtReq})`);
+      else if (n.state) lines.push(`state: ${n.state}`);
+      if (!n.dead) lines.push(`children: ${n.children.size}`);
+      tooltip.textContent = lines.join("\n");
+      tooltip.style.display = "block";
+    })
+    .on("mousemove", ev => {
+      tooltip.style.left = (ev.offsetX + 14) + "px";
+      tooltip.style.top = (ev.offsetY - 10) + "px";
+    })
+    .on("mouseleave", () => { tooltip.style.display = "none"; });
+}
+
+// ── Stats panel ────────────────────────────────────────────────────────
+function updateStats() {
+  if (currentReq < 0 || currentReq >= reqStats.length) return;
+  const s = reqStats[currentReq];
+  const total = s.hit + s.miss;
+  const hr = total > 0 ? (s.hit / total * 100).toFixed(1) : "0.0";
+
+  // Running average hit rate
+  let sumHit = 0, sumTot = 0;
+  const lo = Math.max(0, currentReq - 99);
+  for (let i = lo; i <= currentReq; i++) {
+    sumHit += reqStats[i].hit;
+    sumTot += reqStats[i].hit + reqStats[i].miss;
+  }
+  const avgHr = sumTot > 0 ? (sumHit / sumTot * 100).toFixed(1) : "0.0";
+
+  // Cumulative
+  let cHit = 0, cTot = 0;
+  for (let i = 0; i <= currentReq; i++) {
+    cHit += reqStats[i].hit;
+    cTot += reqStats[i].hit + reqStats[i].miss;
+  }
+  const cumHr = cTot > 0 ? (cHit / cTot * 100).toFixed(1) : "0.0";
+
+  document.getElementById("stats").innerHTML = [
+    `<span class="label">Request</span> <span class="val">#${currentReq}</span>`,
+    `<span class="label">Hit / Miss</span> <span class="val">${s.hit} / ${s.miss}</span>`,
+    `<span class="label">This req HR</span> <span class="val">${hr}%</span>`,
+    `<span class="label">Rolling-100 HR</span> <span class="val">${avgHr}%</span>`,
+    `<span class="label">Cumulative HR</span> <span class="val">${cumHr}%</span>`,
+    `<span class="label">Cache tokens</span> <span class="val">${s.cap}</span>`,
+    `<span class="label">Tree nodes</span> <span class="val">${treeNodes.size - 1}</span>`,
+  ].join("<br>");
+}
+
+// ── Hit rate chart (canvas) ────────────────────────────────────────────
+function updateChart() {
+  const canvas = document.getElementById("chart");
+  const wrap = document.getElementById("chart-wrap");
+  const dpr = window.devicePixelRatio || 1;
+  const W = wrap.clientWidth;
+  const H = wrap.clientHeight;
+  canvas.width = W * dpr;
+  canvas.height = H * dpr;
+  canvas.style.width = W + "px";
+  canvas.style.height = H + "px";
+  const ctx = canvas.getContext("2d");
+  ctx.scale(dpr, dpr);
+  ctx.clearRect(0, 0, W, H);
+
+  if (reqStats.length === 0) return;
+
+  const pad = { top: 20, right: 10, bottom: 24, left: 40 };
+  const cw = W - pad.left - pad.right;
+  const ch = H - pad.top - pad.bottom;
+
+  // Compute rolling hit rate (window = 50)
+  const windowSize = Math.max(1, Math.min(50, Math.floor(reqStats.length / 10)));
+  const rolling = [];
+  let wHit = 0, wTot = 0;
+  for (let i = 0; i < reqStats.length; i++) {
+    wHit += reqStats[i].hit;
+    wTot += reqStats[i].hit + reqStats[i].miss;
+    if (i >= windowSize) {
+      wHit -= reqStats[i - windowSize].hit;
+      wTot -= reqStats[i - windowSize].hit + reqStats[i - windowSize].miss;
+    }
+    rolling.push(wTot > 0 ? wHit / wTot : 0);
+  }
+
+  // Draw axes
+  ctx.strokeStyle = "#334";
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.moveTo(pad.left, pad.top);
+  ctx.lineTo(pad.left, pad.top + ch);
+  ctx.lineTo(pad.left + cw, pad.top + ch);
+  ctx.stroke();
+
+  // Y-axis labels
+  ctx.fillStyle = "#7a7aa0";
+  ctx.font = "10px monospace";
+  ctx.textAlign = "right";
+  for (let v = 0; v <= 1; v += 0.25) {
+    const y = pad.top + ch * (1 - v);
+    ctx.fillText((v * 100).toFixed(0) + "%", pad.left - 4, y + 3);
+    ctx.strokeStyle = "#222";
+    ctx.beginPath(); ctx.moveTo(pad.left, y); ctx.lineTo(pad.left + cw, y); ctx.stroke();
+  }
+
+  // Title
+  ctx.fillStyle = "#a0a0c0";
+  ctx.textAlign = "center";
+  ctx.fillText(`Hit Rate (rolling ${windowSize})`, pad.left + cw / 2, 12);
+
+  // Draw line
+  const n = rolling.length;
+  const xStep = cw / Math.max(1, n - 1);
+  ctx.strokeStyle = "#e94560";
+  ctx.lineWidth = 1.5;
+  ctx.beginPath();
+  for (let i = 0; i < n; i++) {
+    const x = pad.left + i * xStep;
+    const y = pad.top + ch * (1 - rolling[i]);
+    if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+  }
+  ctx.stroke();
+
+  // Current position marker
+  if (currentReq >= 0 && currentReq < n) {
+    const cx = pad.left + currentReq * xStep;
+    const cy = pad.top + ch * (1 - rolling[currentReq]);
+    ctx.fillStyle = "#fff";
+    ctx.beginPath(); ctx.arc(cx, cy, 4, 0, Math.PI * 2); ctx.fill();
+    ctx.strokeStyle = "#e94560";
+    ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(cx, pad.top); ctx.lineTo(cx, pad.top + ch); ctx.stroke();
+  }
+}
+
+// ── Spacing slider ────────────────────────────────────────────────────
+document.getElementById("hspacing").addEventListener("input", e => {
+  document.getElementById("hspacing-val").textContent = e.target.value;
+  if (currentReq >= 0) render();
+});
+
+// ── Resize ─────────────────────────────────────────────────────────────
+window.addEventListener("resize", () => { if (currentReq >= 0) render(); });
+</script>
+</body>
+</html>

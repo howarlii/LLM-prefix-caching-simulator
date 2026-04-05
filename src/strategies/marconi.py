@@ -5,48 +5,38 @@ Admission (hybrid mode only)
 Mamba SSM states are admitted at two types of high-value positions:
 
 1. **Turn-end nodes** – the last inserted node of every request
-   (``node.is_turn_end``).  Multi-turn continuations are the primary
-   reuse pattern, so the SSM state at the end of each response is
-   always worth storing.
+   (``node.is_turn_end``).
 
 2. **Fork-point parents** – when a newly inserted suffix creates a
    second branch off an existing tree node, that node becomes a fork
-   (shared prefix split).  Its Mamba state is admitted via
-   ``on_new_nodes_inserted`` so it is available for future requests
-   that share the same prefix.
+   (shared prefix split).
 
-Eviction (FLOP-aware)
----------------------
-Score for node *n*:
+Eviction (FLOP-aware, unified)
+------------------------------
+All eviction candidates — both Mamba-state demotions and full leaf
+removals — are scored on one axis:
 
-    S(n) = recency(n) + α · flop_efficiency(n)
+    value_density = raw_score / capacity_freed
 
-Both terms normalised to [0, 1] over the current candidate set.
+where ``raw_score = recency + alpha * flop_efficiency`` (both normalised
+to [0, 1]).  The candidate with the **lowest** value density is evicted.
 
-* ``recency(n)`` – normalised ``last_access`` timestamp (higher = more
-  recently used).
+* ``recency(n)`` – normalised ``last_access`` timestamp.
 * ``flop_efficiency(n)`` – normalised cumulative token depth from root
-  to *n* (higher = longer sequence = more FLOPs saved per byte of
-  Mamba state).
+  to *n* (higher = longer sequence = more FLOPs saved).
 
-Nodes with the **lowest** score are evicted first, which prefers
-evicting short/stale entries and retaining long/recent ones.
-
-Evictable node sets
-~~~~~~~~~~~~~~~~~~~
-* ``select_mamba_state_evictions``: nodes with ``has_mamba_state`` and
-  ``len(children) <= 1``.  Dropping only the Mamba state from a
-  single-child intermediate node frees the fixed SSM-state budget
-  while keeping its KV pages (absorbed by its child's path).
-* ``select_nodes``: leaf nodes (standard full removal).
+Candidate sets:
+* Mamba-state demotion: ``has_mamba_state and len(children) <= 1``.
+  Frees ``mamba_state_token_equiv`` capacity.
+* Leaf removal: leaf nodes.  Frees page tokens (+ pruned chain).
 """
 
 from __future__ import annotations
 
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 from src.radix_tree import RadixNode, RadixTree
-from src.strategies.base import EvictionStrategy
+from src.strategies.base import EvictOp, EvictionStrategy
 
 
 def _depth_tokens(node: RadixNode) -> int:
@@ -59,31 +49,18 @@ def _depth_tokens(node: RadixNode) -> int:
     return d
 
 
-def _flop_aware_sort(
-    nodes: List[RadixNode], alpha: float
-) -> List[Tuple[float, RadixNode]]:
-    """Return ``(score, node)`` pairs sorted ascending (lowest score first).
-
-    Score = recency + alpha * flop_efficiency, both in [0, 1].
-    Ties broken by depth (shallower = lower score = evict sooner).
-    """
-    if not nodes:
-        return []
-
-    recencies = [n.last_access for n in nodes]
-    depths = [_depth_tokens(n) for n in nodes]
-
-    min_r, max_r = min(recencies), max(recencies)
-    min_d, max_d = min(depths), max(depths)
-
-    scored: List[Tuple[float, RadixNode]] = []
-    for n, r, d in zip(nodes, recencies, depths):
-        norm_r = (r - min_r) / (max_r - min_r) if max_r > min_r else 0.0
-        norm_d = (d - min_d) / (max_d - min_d) if max_d > min_d else 0.0
-        scored.append((norm_r + alpha * norm_d, n))
-
-    scored.sort(key=lambda x: x[0])
-    return scored
+def _estimate_leaf_free(leaf: RadixNode) -> int:
+    """Estimate tokens freed by removing a leaf and pruning its empty chain."""
+    total = len(leaf.page)
+    cur = leaf.parent
+    while cur is not None and cur.parent is not None:
+        if len(cur.children) > 1:
+            break
+        if cur.has_mamba_state:
+            break
+        total += len(cur.page)
+        cur = cur.parent
+    return total
 
 
 class MarconiStrategy(EvictionStrategy):
@@ -96,7 +73,7 @@ class MarconiStrategy(EvictionStrategy):
         Higher values favour retaining long-sequence Mamba states.
     """
 
-    def __init__(self, alpha: float = 1.0) -> None:
+    def __init__(self, alpha: float = 1.5) -> None:
         self.alpha = alpha
 
     # ------------------------------------------------------------------
@@ -110,47 +87,91 @@ class MarconiStrategy(EvictionStrategy):
     def on_new_nodes_inserted(
         self, tree: RadixTree, new_nodes: List[RadixNode]
     ) -> None:
-        """Admit Mamba state at fork-point parents created by this insertion.
-
-        When the first new node creates a second branch off an existing tree
-        node (len(parent.children) > 1), that parent has just become a shared
-        prefix split point.  Its Mamba state is admitted here so future
-        requests reaching that fork can skip recomputation.
-        """
+        """Admit Mamba state at fork-point parents created by this insertion."""
         if not new_nodes:
             return
         parent = new_nodes[0].parent
         if parent is None or parent is tree.root:
             return
-        # A fork point: parent now has more than one child branch.
         if len(parent.children) > 1 and not parent.has_mamba_state:
             tree.set_mamba_state(parent)
 
     # ------------------------------------------------------------------
-    # Eviction
+    # Unified eviction
     # ------------------------------------------------------------------
 
-    def select_mamba_state_evictions(
-        self, tree: RadixTree, num_states: int
-    ) -> List[RadixNode]:
-        """Evict Mamba states from low-value nodes with <= 1 child.
+    def _collect_and_score(
+        self, tree: RadixTree
+    ) -> List[Tuple[float, RadixNode, EvictOp]]:
+        """Score all eviction candidates on one axis.
 
-        Single-child intermediate nodes represent non-shared path segments;
-        their SSM states can be dropped while their KV pages remain accessible
-        through their child's path.
+        Returns list of ``(value_density, node, op)`` sorted ascending.
         """
-        candidates = [
-            n
-            for n in tree.iter_nodes()
-            if n.has_mamba_state and len(n.children) <= 1
-        ]
-        scored = _flop_aware_sort(candidates, self.alpha)
-        return [n for _, n in scored[:num_states]]
+        mte = tree.mamba_state_token_equiv
+
+        mamba_candidates: List[RadixNode] = []
+        leaf_candidates: List[RadixNode] = []
+        for n in tree.iter_nodes():
+            if n.is_leaf():
+                leaf_candidates.append(n)
+            if n.has_mamba_state and len(n.children) <= 1:
+                mamba_candidates.append(n)
+
+        all_nodes: List[Tuple[RadixNode, EvictOp]] = (
+            [(n, "mamba") for n in mamba_candidates]
+            + [(n, "leaf") for n in leaf_candidates]
+        )
+        if not all_nodes:
+            return []
+
+        recencies = [n.last_access for n, _ in all_nodes]
+        depths = [_depth_tokens(n) for n, _ in all_nodes]
+
+        min_r, max_r = min(recencies), max(recencies)
+        min_d, max_d = min(depths), max(depths)
+
+        scored: List[Tuple[float, RadixNode, EvictOp]] = []
+        for (n, op), r, d in zip(all_nodes, recencies, depths):
+            norm_r = (r - min_r) / (max_r - min_r) if max_r > min_r else 0.0
+            norm_d = (d - min_d) / (max_d - min_d) if max_d > min_d else 0.0
+            raw_score = norm_r + self.alpha * norm_d
+
+            if op == "mamba":
+                freed = max(mte, 1)
+            else:
+                freed = max(_estimate_leaf_free(n), 1)
+                if n.has_mamba_state:
+                    freed += mte
+
+            scored.append((raw_score / freed, n, op))
+
+        scored.sort(key=lambda x: x[0])
+        return scored
+
+    def select_eviction(
+        self, tree: RadixTree
+    ) -> Optional[Tuple[RadixNode, EvictOp]]:
+        """Pick the single best eviction action via unified scoring."""
+        scored = self._collect_and_score(tree)
+        if not scored:
+            return None
+        _, node, op = scored[0]
+        return (node, op)
 
     def select_nodes(self, tree: RadixTree, num_nodes: int) -> List[RadixNode]:
-        """Evict leaf nodes using FLOP-aware scoring."""
+        """Fallback for non-hybrid mode (no mamba states)."""
         leaves = tree.leaf_nodes()
         if not leaves:
             return []
-        scored = _flop_aware_sort(leaves, self.alpha)
+        recencies = [n.last_access for n in leaves]
+        depths = [_depth_tokens(n) for n in leaves]
+        min_r, max_r = min(recencies), max(recencies)
+        min_d, max_d = min(depths), max(depths)
+
+        scored: List[Tuple[float, RadixNode]] = []
+        for n, r, d in zip(leaves, recencies, depths):
+            norm_r = (r - min_r) / (max_r - min_r) if max_r > min_r else 0.0
+            norm_d = (d - min_d) / (max_d - min_d) if max_d > min_d else 0.0
+            scored.append((norm_r + self.alpha * norm_d, n))
+        scored.sort(key=lambda x: x[0])
         return [n for _, n in scored[:num_nodes]]

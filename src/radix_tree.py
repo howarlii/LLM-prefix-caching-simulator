@@ -27,7 +27,7 @@ class RadixNode:
     page: PageKey
     parent: Optional[RadixNode] = None
     children: Dict[PageKey, RadixNode] = field(default_factory=dict)
-    last_access: int = 0.0
+    last_access: int = 0
     access_count: int = 0
     creation_order: int = 0
     # True if some request ended at this node (multi-turn "previous turn" boundary).
@@ -38,7 +38,7 @@ class RadixNode:
     def is_leaf(self) -> bool:
         return len(self.children) == 0
 
-    def touch(self, timestamp: int = 0.0) -> None:
+    def touch(self, timestamp: int = 0) -> None:
         self.last_access = timestamp
         self.access_count += 1
 
@@ -232,18 +232,24 @@ class RadixTree:
             q.extend(n.children.values())
         return out
 
-    def remove_leaf(self, node: RadixNode) -> None:
-        """Remove a leaf and prune ancestors until a branch or root is reached."""
+    def remove_leaf(self, node: RadixNode) -> List[RadixNode]:
+        """Remove a leaf and prune ancestors until a branch or root is reached.
+
+        Returns the list of all removed nodes (the leaf plus any pruned
+        ancestors), useful for logging / debugging.
+        """
         if node is self._root or not node.is_leaf():
-            return
+            return []
         self._remove_node_accounting(node)
         parent = node.parent
         if parent is None or node.page not in parent.children:
-            return
+            return [node]
         del parent.children[node.page]
-        self._prune_empty_chain(parent)
+        pruned = self._prune_empty_chain(parent)
+        return [node] + pruned
 
-    def _prune_empty_chain(self, node: RadixNode) -> None:
+    def _prune_empty_chain(self, node: RadixNode) -> List[RadixNode]:
+        removed: List[RadixNode] = []
         cur: Optional[RadixNode] = node
         while cur is not None and cur is not self._root and len(cur.children) == 0:
             # In hybrid mode, preserve nodes that carry a Mamba state —
@@ -257,7 +263,9 @@ class RadixTree:
             pk = cur.page
             if pk in parent.children:
                 del parent.children[pk]
+            removed.append(cur)
             cur = parent
+        return removed
 
     def iter_nodes(self) -> Iterator[RadixNode]:
         """Breadth-first over all nodes except the empty root (no stack overflow on deep chains)."""

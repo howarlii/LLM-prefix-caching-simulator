@@ -7,6 +7,7 @@ import json
 import multiprocessing as mp
 import os
 import random
+import sys
 from collections import defaultdict, deque
 from dataclasses import dataclass
 from pathlib import Path
@@ -29,11 +30,71 @@ class TokenizedRequest:
     meta: dict
 
 
+# ── Module-level caches ──────────────────────────────────────────────────────
+_tokenizer_cache: Dict[str, object] = {}
+_MODEL_MAX_LENGTH_CACHE_FILE = TOKEN_CACHE_DIR / ".model_max_lengths.json"
+
+
 def _load_tokenizer(name: str):
+    """Load tokenizer with in-process caching (avoids repeated from_pretrained)."""
+    if name in _tokenizer_cache:
+        return _tokenizer_cache[name]
     ensure_cpu_only()
     from transformers import AutoTokenizer
 
-    return AutoTokenizer.from_pretrained(name, trust_remote_code=True)
+    tok = AutoTokenizer.from_pretrained(name, trust_remote_code=True)
+    _tokenizer_cache[name] = tok
+    return tok
+
+
+def _capped_model_max_length(tok) -> int:
+    m = getattr(tok, "model_max_length", None)
+    if m is None or m > 1_000_000:
+        m = 131_072
+    return m
+
+
+def _get_encode_max_length(tokenizer_name: str) -> int:
+    """Compute encode_max_length, avoiding full tokenizer load via disk cache.
+
+    On the first call for a given tokenizer the model is loaded and the
+    ``model_max_length`` is persisted to ``TOKEN_CACHE_DIR/.model_max_lengths.json``.
+    Subsequent calls (even across processes) read the disk cache and skip the
+    expensive ``AutoTokenizer.from_pretrained``.
+    """
+    m: int | None = None
+    # 1. Try disk cache
+    try:
+        if _MODEL_MAX_LENGTH_CACHE_FILE.is_file():
+            data = json.loads(_MODEL_MAX_LENGTH_CACHE_FILE.read_text(encoding="utf-8"))
+            if tokenizer_name in data:
+                m = int(data[tokenizer_name])
+    except Exception:
+        pass
+
+    # 2. Fall back to loading the tokenizer (and persist the result)
+    if m is None:
+        tok = _load_tokenizer(tokenizer_name)
+        m = _capped_model_max_length(tok)
+        try:
+            disk: dict = {}
+            if _MODEL_MAX_LENGTH_CACHE_FILE.is_file():
+                disk = json.loads(_MODEL_MAX_LENGTH_CACHE_FILE.read_text(encoding="utf-8"))
+            disk[tokenizer_name] = m
+            _MODEL_MAX_LENGTH_CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
+            _MODEL_MAX_LENGTH_CACHE_FILE.write_text(
+                json.dumps(disk, ensure_ascii=False), encoding="utf-8"
+            )
+        except Exception:
+            pass
+
+    # 3. Apply env-var override
+    raw = os.environ.get("KV_SIM_MAX_INPUT_TOKENS", "").strip()
+    if raw.isdigit():
+        u = int(raw)
+        if u > 0:
+            return min(u, m)
+    return m
 
 
 def _encode_max_length(tok) -> int:
@@ -174,9 +235,8 @@ def load_or_tokenize(
 ) -> List[TokenizedRequest]:
     """Load token ids from disk cache or compute and save."""
     TOKEN_CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    _tok = _load_tokenizer(tokenizer_name)
-    encode_max_length = _encode_max_length(_tok)
-    del _tok
+    # Fast path: resolve encode_max_length from disk cache (skips tokenizer load).
+    encode_max_length = _get_encode_max_length(tokenizer_name)
     key = _cache_key_parts(
         dataset_name, tokenizer_name, requests, encode_max_length=encode_max_length
     )
@@ -186,8 +246,12 @@ def load_or_tokenize(
     def _try_load(path: Path, want: int) -> List[TokenizedRequest]:
         """Read the first ``want`` lines from a cache file; return [] on mismatch."""
         out: List[TokenizedRequest] = []
+        show_bar = want >= 1000 and sys.stderr.isatty()
         with path.open(encoding="utf-8") as f:
-            for req, line in zip(requests, f):
+            it = zip(requests, f)
+            if show_bar:
+                it = tqdm(it, total=want, desc="Loading cached tokens", leave=False, unit="req")
+            for req, line in it:
                 row = json.loads(line)
                 out.append(
                     TokenizedRequest(

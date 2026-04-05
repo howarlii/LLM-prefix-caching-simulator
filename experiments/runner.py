@@ -24,7 +24,7 @@ from src.request_generator import (
     load_or_tokenize,
     order_requests,
 )
-from src.strategies import CRFDecouplingStrategy, FIFOStrategy, LFUStrategy, LRUStrategy, MarconiStrategy, EvictionStrategy
+from src.strategies import CRFDecouplingStrategy, FIFOStrategy, LFUStrategy, LRUStrategy, MarconiStrategy, Marconi2Strategy, EvictionStrategy
 
 
 def effective_page_size(dataset: str, page_size: int) -> int:
@@ -47,6 +47,10 @@ def strategy_from_name(name: str) -> EvictionStrategy:
         parts = n.split("_", 1)
         alpha = float(parts[1]) if len(parts) == 2 else 1.0
         return MarconiStrategy(alpha=alpha)
+    if n == "marconi2" or n.startswith("marconi2_"):
+        parts = n.split("_", 1)
+        alpha = float(parts[1]) if len(parts) == 2 else 1.0
+        return Marconi2Strategy(alpha=alpha)
     if n == "crf_decoupling" or n.startswith("crf_decoupling_"):
         # Optional lambda suffix: "crf_decoupling_0.01" → lambda_decay=0.01
         parts = n.split("_", 2)
@@ -69,12 +73,14 @@ def run_simulation(
     strategy: EvictionStrategy,
     capacity_tokens: Optional[int],
     mamba_state_token_equiv: int = 0,
+    logger: object = None,
 ) -> RunMetrics:
     sim = KVCacheSimulator(
         page_size=page_size,
         strategy=strategy,
         capacity_tokens=capacity_tokens,
         mamba_state_token_equiv=mamba_state_token_equiv,
+        logger=logger,
     )
     for req in tqdm(requests, desc="Simulating", leave=False, disable=not sys.stderr.isatty()):
         sim.process_token_ids(req.token_ids)
