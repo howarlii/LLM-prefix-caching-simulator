@@ -41,7 +41,7 @@ from viz.tree_logger import TreeLogger, _log_filename
 # ── Global defaults (overridable per-experiment) ────────────────────────────
 DATASET         = "swesmith" # swesmith | loogle | narrativeqa | sharegpt_90k_raw | mooncake_toolagent | mooncake_conversation
 PAGE_SIZE       = 32
-ORDERING        = "random"
+ORDERING        = "timestamp"  # original | min_distance | max_distance | random | timestamp
 STRATEGY        = "marconi"
 CAPACITY        = "160"          # GB, or "inf"/"unlimited"
 MODEL_NAME      = DEFAULT_MODEL.name  # see ModelConfig.list_models() for options
@@ -79,27 +79,26 @@ EXPERIMENTS: list[dict] = []
 # Example: sweep page_size × capacity for marconi and marconi2
 for ds in ["swesmith", "loogle", "narrativeqa", "sharegpt_90k_raw"]:
 # for ds in ["swesmith"]:
-    for page_size in [1, 32, 256, 1024]:
-    # for page_size in [1, 256]:
-        for capacity in [80, 160, 320, 640, "inf"]:
+    # for page_size in [1, 32, 256, 1024]:
+    for page_size in [1, 32, 256]:
+        for capacity in [80, 160, "inf"]:
             # EXPERIMENTS.append(dict(page_size=page_size, dataset=ds, strategy="lru",  capacity=capacity))
             # EXPERIMENTS.append(dict(page_size=page_size, dataset=ds, strategy="marconi",  capacity=capacity))
             # EXPERIMENTS.append(dict(page_size=page_size, dataset=ds, strategy="marconi3_ev0_mn0", capacity=capacity))
             # EXPERIMENTS.append(dict(page_size=page_size, dataset=ds, strategy="marconi3", capacity=capacity))
             # EXPERIMENTS.append(dict(page_size=page_size, dataset=ds, strategy="marconi3_ev1_mn0", capacity=capacity))
             # EXPERIMENTS.append(dict(page_size=page_size, dataset=ds, strategy="marconi3_ev1_mn1", capacity=capacity))
-            EXPERIMENTS.append(dict(page_size=page_size, dataset=ds, strategy="marconi3_ev2_mn0", capacity=capacity))
+            EXPERIMENTS.append(dict(page_size=page_size, dataset=ds, strategy="marconi3_ev0_mn0", capacity=capacity))
 
 # Log datasets
-# ENABLE_LOG      = True
-# MAX_REQUESTS    = 1000
+ENABLE_LOG      = True
+MAX_REQUESTS    = 1000
 # capacity = "inf"
-# EXPERIMENTS: list[dict] = []
-# for ds in ["swesmith", "loogle", "narrativeqa", "sharegpt_90k_raw"]:
-#     # for page_size in [1, 32, 256]:
-#     for page_size in [1]:
-#         EXPERIMENTS.append(dict(page_size=page_size, strategy="marconi",  capacity=capacity, dataset=ds))
-#         EXPERIMENTS.append(dict(page_size=page_size, strategy="marconi2",  capacity=capacity, dataset=ds))
+EXPERIMENTS: list[dict] = []
+for ds in ["swesmith", "loogle", "narrativeqa", "sharegpt_90k_raw"]:
+    for page_size in [1, 32, 256]:
+        for capacity in [20, 80, "inf"]:
+            EXPERIMENTS.append(dict(page_size=page_size, strategy="marconi3_ev1_mn0",  capacity=capacity, dataset=ds))
 
 # ╔═══════════════════════════════════════════════════════════════════════════╗
 # ║                       END OF CONFIGURATION                                ║

@@ -69,7 +69,7 @@ def strategy_from_name(name: str, model: ModelConfig = DEFAULT_MODEL) -> Evictio
         kwargs = {"alpha": float(m.group(1))} if m else {}
         return Marconi2Strategy(**kwargs)
     # Marconi3 ablation variants: marconi3_e{0|1}_mn{0|1}[_a<float>]
-    m3_ablation = re.match(r"^marconi3_ev([d])_mn([01])", n)
+    m3_ablation = re.match(r"^marconi3_ev([\d])_mn([01])", n)
     if m3_ablation:
         evict_mode = f"ev{m3_ablation.group(1)}"
         use_mn = m3_ablation.group(2) == "1"
@@ -224,7 +224,7 @@ def persist_result_row(
         "model_name": row.get("model_name", ""),
     }
 
-    KEY_FIELDS = ("dataset", "page_size", "ordering", "strategy", "capacity_spec")
+    KEY_FIELDS = ("dataset", "page_size", "ordering", "strategy", "capacity_spec", "num_req")
 
     new_row = {k: flat.get(k, "") for k in RESULT_CSV_FIELDS}
     key = tuple(str(new_row.get(k, "")) for k in KEY_FIELDS)

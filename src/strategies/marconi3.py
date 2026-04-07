@@ -314,7 +314,10 @@ class Marconi3Strategy(EvictionStrategy):
         flop_eff = flops_savings / memory_occupy.
         score = norm_r + alpha * norm_d
         """
-        recencies = [n.last_access for n, _, _, _ in candidates]
+        recency_values = [
+            1.0 / max(current_ts - n.last_access, 1)
+            for n, _, _, _ in candidates
+        ]
 
         flop_eff_values = []
         for n, op, dt, cp in candidates:
@@ -325,7 +328,7 @@ class Marconi3Strategy(EvictionStrategy):
                 mem = self._mamba_memory_occupy()
             flop_eff_values.append(flops / mem if mem > 0 else 0.0)
 
-        norm_recency = _normalize(recencies)
+        norm_recency = _normalize(recency_values)
         norm_flop_eff = _normalize(flop_eff_values)
 
         scored: List[Tuple[float, RadixNode, EvictOp]] = []

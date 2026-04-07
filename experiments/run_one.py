@@ -26,18 +26,18 @@ from experiments.runner import (
 
 def main() -> None:
     p = argparse.ArgumentParser(description="Run a single KV cache simulation")
-    p.add_argument("--dataset", default="loogle",
+    p.add_argument("--dataset", default="swesmith",
                    help="loogle | narrativeqa | sharegpt | sharegpt_90k_raw | mooncake_toolagent | mooncake_conversation")
     p.add_argument("--page-size", type=int, default=32)
-    p.add_argument("--ordering", default="random",
+    p.add_argument("--ordering", default="timestamp",
                    help="original | min_distance | max_distance | random | timestamp")
     p.add_argument("--sessions-per-second", type=float, default=1.0,
                    help="Session arrival rate (only used with --ordering timestamp)")
     p.add_argument("--words-per-min", type=float, default=90.0,
                    help="Simulated user typing speed (only used with --ordering timestamp)")
-    p.add_argument("--strategy", default="lru",
+    p.add_argument("--strategy", default="marconi3_ev1_mn0",
                    help="lru | lfu | fifo | marconi")
-    p.add_argument("--capacity", default="160",
+    p.add_argument("--capacity", default="20",
                    help="Cache capacity in GB (e.g. 20) or inf")
     p.add_argument("--tokenizer", default=DEFAULT_TOKENIZER_NAME)
     p.add_argument("--seed", type=int, default=0)
