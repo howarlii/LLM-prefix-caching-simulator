@@ -221,14 +221,13 @@ class RadixTree:
 
     def simulate_request(
         self, pages: List[PageKey]
-    ) -> Tuple[int, int, int, int, int, List[RadixNode], List[RadixNode]]:
+    ) -> Tuple[int, int, int, int, List[RadixNode], List[RadixNode]]:
         """Match longest page prefix, touch hit nodes, insert missing suffix.
 
         Returns
         -------
         hit_pages : int
         hit_tokens : int
-        kv_only_hit_pages : int
         total_input_tokens : int
         turn_hit_tokens : int
         new_nodes : List[RadixNode]
@@ -297,11 +296,9 @@ class RadixTree:
             else:
                 hit_pages = 0
                 hit_tokens = 0
-            kv_only_hit_pages = total_matched_pages - hit_pages
         else:
             hit_pages = total_matched_pages
             hit_tokens = total_matched_tokens
-            kv_only_hit_pages = 0
 
         # Turn hit: tokens up to the deepest is_turn_end node within effective hit range.
         effective_range = (effective_hit_idx + 1) if self._mamba_state_token_equiv > 0 else len(matched_nodes)
@@ -332,7 +329,7 @@ class RadixTree:
         node.is_turn_end = True
 
         total_tokens = sum(len(x) for x in pages)
-        return hit_pages, hit_tokens, kv_only_hit_pages, total_tokens, turn_hit_tokens, new_nodes, matched_nodes
+        return hit_pages, hit_tokens, total_tokens, turn_hit_tokens, new_nodes, matched_nodes
 
     # ------------------------------------------------------------------
     # Leaf / mamba accessors (backed by incremental indexes)

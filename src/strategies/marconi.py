@@ -38,38 +38,17 @@ from __future__ import annotations
 from collections import deque
 from typing import List, Optional, Tuple
 
+from src.model_config import (
+    DEFAULT_MODEL,
+    ModelConfig,
+    _attn_flops,
+    _kvs_size,
+    _mamba1_flops,
+    _mamba_state_size,
+    _mlp_flops,
+)
 from src.radix_tree import RadixNode, RadixTree
 from src.strategies.base import EvictOp, EvictionStrategy
-
-
-# ---------------------------------------------------------------------------
-# FLOP / memory helpers (matching marconi/utils.py exactly)
-# ---------------------------------------------------------------------------
-
-def _attn_flops(l: int, d: int) -> float:
-    """Attention block FLOPs: 8·L·D² + 4·L²·D."""
-    return 8 * l * d ** 2 + 4 * l ** 2 * d
-
-
-def _mlp_flops(l: int, d: int) -> float:
-    """MLP block FLOPs: 16·L·D²."""
-    return 16 * l * d ** 2
-
-
-def _mamba1_flops(l: int, d: int, n: int) -> float:
-    """Mamba-1 layer FLOPs: 12·L·D² + 16·L·D·N + 10·L·D."""
-    return 12 * l * d ** 2 + 16 * l * d * n + 10 * l * d
-
-
-def _kvs_size(l: int, d: int) -> float:
-    """KV cache size in bytes for one attention layer: 2·L·D·2."""
-    return 2 * l * d * 2
-
-
-def _mamba_state_size(d: int, n: int, conv_kernel: int = 4, expand: int = 2) -> float:
-    """SSM + conv state size in bytes for one SSM layer."""
-    return d * n * 2 + (expand * d + 2 * n) * conv_kernel * 2
-
 
 
 def _normalize(values: List[float], default: float = 1.0) -> List[float]:
@@ -90,29 +69,23 @@ class MarconiStrategy(EvictionStrategy):
     alpha:
         Weight for the FLOP-efficiency term in the eviction score.
         Higher values favour retaining long-sequence Mamba states.
-    num_ssm_layers, num_attn_layers, num_mlp_layers:
-        Model layer counts for FLOP computation.
-    d:
-        Model hidden dimension.
-    n:
-        SSM state dimension.
+    model:
+        Model architecture configuration.  Provides layer counts, hidden
+        dimension, and SSM state dimension for FLOP computation.
     """
 
     def __init__(
         self,
         alpha: float = 1.5,
-        num_ssm_layers: int = 48,
-        num_attn_layers: int = 16,
-        num_mlp_layers: int = 64,
-        d: int = 4096,
-        n: int = 128,
+        model: ModelConfig = DEFAULT_MODEL,
     ) -> None:
         self.alpha = alpha
-        self.num_ssm_layers = num_ssm_layers
-        self.num_attn_layers = num_attn_layers
-        self.num_mlp_layers = num_mlp_layers
-        self.d = d
-        self.n = n
+        self.model = model
+        self.num_ssm_layers = model.num_ssm_layers
+        self.num_attn_layers = model.num_attn_layers
+        self.num_mlp_layers = model.num_mlp_layers
+        self.d = model.d_model
+        self.n = model.ssm_state_dim
 
     @property
     def drop_partial_last_page(self) -> bool:

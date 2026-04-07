@@ -19,6 +19,7 @@ from src.config import (
 )
 from src.datasets_loader import is_mooncake_trace_dataset, load_raw_requests
 from src.metrics import RunMetrics, compute_run_metrics
+from src.model_config import DEFAULT_MODEL, ModelConfig
 from src.request_generator import (
     OrderingName,
     TokenizedRequest,
@@ -35,7 +36,7 @@ def effective_page_size(dataset: str, page_size: int) -> int:
     return page_size
 
 
-def strategy_from_name(name: str) -> EvictionStrategy:
+def strategy_from_name(name: str, model: ModelConfig = DEFAULT_MODEL) -> EvictionStrategy:
     n = name.lower()
     if n == "lru":
         return LRUStrategy()
@@ -46,8 +47,8 @@ def strategy_from_name(name: str) -> EvictionStrategy:
     if n == "marconi" or n.startswith("marconi_"):
         # Optional alpha suffix: "marconi_a2.0" → alpha=2.0
         m = re.search(r"_a([\d.]+)", n)
-        kwargs = {"alpha": float(m.group(1))} if m else {}
-        return MarconiStrategy(**kwargs)
+        kwargs: dict = {"alpha": float(m.group(1))} if m else {}
+        return MarconiStrategy(model=model, **kwargs)
     # Marconi2 ablation variants: marconi2_e{0|1}_mn{0|1}[_a<float>]
     # e0 = root-relative evict (original), e1 = checkpoint-relative evict (new)
     # mn0 = no mid-chain mamba, mn1 = mid-chain mamba (new)
@@ -69,11 +70,11 @@ def strategy_from_name(name: str) -> EvictionStrategy:
         use_mn = m3_ablation.group(2) == "1"
         m_alpha = re.search(r"_a([\d.]+)", n[m3_ablation.end():])
         kwargs = {"alpha": float(m_alpha.group(1))} if m_alpha else {}
-        return Marconi3Strategy(evict_mode=evict_mode, use_mid_chain_checkpoint=use_mn, **kwargs)
+        return Marconi3Strategy(evict_mode=evict_mode, use_mid_chain_checkpoint=use_mn, model=model, **kwargs)
     if n == "marconi3" or n.startswith("marconi3_"):
         m = re.search(r"_a([\d.]+)", n)
         kwargs = {"alpha": float(m.group(1))} if m else {}
-        return Marconi3Strategy(**kwargs)
+        return Marconi3Strategy(model=model, **kwargs)
     if n == "crf_decoupling" or n.startswith("crf_decoupling_"):
         # Optional lambda suffix: "crf_decoupling_0.01" → lambda_decay=0.01
         parts = n.split("_", 2)
@@ -82,11 +83,15 @@ def strategy_from_name(name: str) -> EvictionStrategy:
     raise ValueError(f"Unknown strategy {name!r}")
 
 
-def capacity_from_spec(spec: str, kv_bytes_per_token: int) -> Optional[int]:
+def capacity_from_spec(spec: str, kv_bytes_per_token: int | None = None, *, model: ModelConfig | None = None) -> Optional[int]:
     s = spec.strip().lower()
     if s in ("inf", "none", "unlimited"):
         return None
     gb = float(s.replace("gb", "").strip())
+    if model is not None:
+        return model.gb_to_token_capacity(gb)
+    if kv_bytes_per_token is None:
+        raise ValueError("Either model or kv_bytes_per_token must be provided")
     return gb_to_token_capacity(gb, kv_bytes_per_token)
 
 
@@ -97,6 +102,7 @@ def run_simulation(
     capacity_tokens: Optional[int],
     mamba_state_token_equiv: int = 0,
     logger: object = None,
+    model: Optional[ModelConfig] = None,
 ) -> RunMetrics:
     sim = KVCacheSimulator(
         page_size=page_size,
@@ -107,7 +113,7 @@ def run_simulation(
     )
     for req in tqdm(requests, desc="Simulating", leave=False, disable=not sys.stderr.isatty()):
         sim.process_token_ids(req.token_ids)
-    return compute_run_metrics(sim.state, sim.tree)
+    return compute_run_metrics(sim.state, sim.tree, model=model)
 
 
 RESULT_CSV_FIELDS: List[str] = [
@@ -132,8 +138,10 @@ RESULT_CSV_FIELDS: List[str] = [
     "peak_cached_tokens",
     "avg_cached_tokens",
     "total_input_tokens",
-    "compute_savings_rate",
-    "kv_only_hit_pages",
+    "flops_save_rate",
+    "total_flops_no_cache",
+    "total_flops_with_cache",
+    "model_name",
 ]
 
 
@@ -175,8 +183,10 @@ def persist_result_row(
         "peak_cached_tokens": metrics.get("peak_cached_tokens"),
         "avg_cached_tokens": metrics.get("avg_cached_tokens"),
         "total_input_tokens": metrics.get("total_input_tokens"),
-        "compute_savings_rate": metrics.get("compute_savings_rate"),
-        "kv_only_hit_pages": metrics.get("kv_only_hit_pages"),
+        "flops_save_rate": metrics.get("flops_save_rate"),
+        "total_flops_no_cache": metrics.get("total_flops_no_cache"),
+        "total_flops_with_cache": metrics.get("total_flops_with_cache"),
+        "model_name": row.get("model_name", ""),
     }
 
     KEY_FIELDS = ("dataset", "page_size", "ordering", "strategy", "capacity_spec")

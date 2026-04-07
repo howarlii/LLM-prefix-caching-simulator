@@ -28,10 +28,6 @@ class RequestTrace:
     hit_pages: int
     total_pages: int
     turn_hit_tokens: int
-    # Pages whose KV cache was present but had no Mamba state coverage —
-    # they are in the tree but do not yield compute savings in hybrid mode.
-    # Always 0 for pure full-attention (mamba_state_token_equiv == 0).
-    kv_only_hit_pages: int = 0
 
     @property
     def miss_tokens(self) -> int:
@@ -109,7 +105,7 @@ class KVCacheSimulator:
             and len(pages[-1]) < self.page_size
         ):
             pages = pages[:-1]
-        hit_pages, hit_tokens, kv_only_hit_pages, total_tokens, turn_hit_tokens, new_nodes, matched_nodes = (
+        hit_pages, hit_tokens, total_tokens, turn_hit_tokens, new_nodes, matched_nodes = (
             self.tree.simulate_request(pages)
         )
 
@@ -165,7 +161,6 @@ class KVCacheSimulator:
             hit_pages=hit_pages,
             total_pages=len(pages),
             turn_hit_tokens=turn_hit_tokens,
-            kv_only_hit_pages=kv_only_hit_pages,
         )
         self._evict_until_fit()
 

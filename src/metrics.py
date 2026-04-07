@@ -7,6 +7,7 @@ from dataclasses import asdict, dataclass
 from typing import Any, Dict, List, Optional
 
 from src.cache_simulator import SimulationState
+from src.model_config import ModelConfig
 from src.radix_tree import RadixTree
 
 
@@ -48,13 +49,13 @@ class RunMetrics:
     tree_access_by_depth: Dict[str, Any]
     # Per-depth min/p50/p90/p99/max of node access_count (for distribution plots).
     access_percentiles_by_depth: Dict[str, Dict[str, float]]
-    # Fraction of input blocks (pages) where full computation was saved.
-    # For pure full-attention this equals page_level_hit_rate.
-    # For hybrid models, only blocks reachable via a Mamba state checkpoint count.
-    compute_savings_rate: float = 0.0
-    # Total pages that were present in the KV cache but NOT covered by a Mamba
-    # state checkpoint (hybrid mode only; always 0 for pure full-attention).
-    kv_only_hit_pages: int = 0
+    # Fraction of total FLOPs saved by prefix caching compared to no cache.
+    # Computed as 1 - with_cache_flops / no_cache_flops.
+    # None when no ModelConfig is provided (legacy mode).
+    flops_save_rate: Optional[float] = None
+    # Absolute FLOPs values (for downstream analysis).
+    total_flops_no_cache: Optional[float] = None
+    total_flops_with_cache: Optional[float] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -63,6 +64,7 @@ class RunMetrics:
 def compute_run_metrics(
     state: SimulationState,
     tree: RadixTree,
+    model: Optional[ModelConfig] = None,
 ) -> RunMetrics:
     traces = state.traces
     if not traces:
@@ -85,8 +87,6 @@ def compute_run_metrics(
             valid_cached_depth_histogram={},
             tree_access_by_depth={},
             access_percentiles_by_depth={},
-            compute_savings_rate=0.0,
-            kv_only_hit_pages=0,
         )
 
     total_pages_needed = sum(t.total_pages for t in traces)
@@ -94,7 +94,6 @@ def compute_run_metrics(
     total_in = sum(t.input_tokens for t in traces)
     load_tokens = sum(t.hit_tokens for t in traces)
     compute_tokens = sum(t.miss_tokens for t in traces)
-    kv_only_hit_pages = sum(t.kv_only_hit_pages for t in traces)
 
     pr_rates = [t.per_request_token_hit_rate for t in traces]
     pr_sorted = sorted(pr_rates)
@@ -109,12 +108,6 @@ def compute_run_metrics(
     tok_hr = load_tokens / total_in if total_in else 0.0
     turn_hr = turn_hit_tokens / total_in if total_in else 0.0
     lcr = load_tokens / compute_tokens if compute_tokens else float("inf")
-
-    # compute_savings_rate: fraction of blocks where full computation was saved.
-    # In pure full-attention mode this equals page_level_hit_rate.
-    # In hybrid mode, hit_pages already accounts for Mamba state gating, so
-    # this gives the true fraction of blocks that avoid recomputation entirely.
-    compute_savings_rate = page_hr
 
     dh = tree.depth_histogram()
     vch = tree.valid_cached_depth_histogram()
@@ -148,6 +141,20 @@ def compute_run_metrics(
             "max": sv[-1],
         }
 
+    # FLOPs save rate: requires a ModelConfig to compute.
+    flops_save_rate: Optional[float] = None
+    total_flops_no_cache: Optional[float] = None
+    total_flops_with_cache: Optional[float] = None
+    if model is not None and traces:
+        no_cache = sum(model.prefill_flops(t.input_tokens) for t in traces)
+        with_cache = sum(
+            model.incremental_prefill_flops(t.input_tokens, t.hit_tokens)
+            for t in traces
+        )
+        total_flops_no_cache = no_cache
+        total_flops_with_cache = with_cache
+        flops_save_rate = 1.0 - with_cache / no_cache if no_cache > 0 else 0.0
+
     return RunMetrics(
         page_level_hit_rate=page_hr,
         token_level_hit_rate=tok_hr,
@@ -167,6 +174,7 @@ def compute_run_metrics(
         valid_cached_depth_histogram=valid_cached_depth_histogram,
         tree_access_by_depth=tree_access_by_depth,
         access_percentiles_by_depth=access_percentiles_by_depth,
-        compute_savings_rate=compute_savings_rate,
-        kv_only_hit_pages=kv_only_hit_pages,
+        flops_save_rate=flops_save_rate,
+        total_flops_no_cache=total_flops_no_cache,
+        total_flops_with_cache=total_flops_with_cache,
     )

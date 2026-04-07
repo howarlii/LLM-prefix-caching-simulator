@@ -11,7 +11,8 @@ _ROOT = Path(__file__).resolve().parents[1]
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
-from src.config import DEFAULT_TOKENIZER_NAME, KV_BYTES_PER_TOKEN_DEFAULT, RESULTS_DIR
+from src.config import DEFAULT_TOKENIZER_NAME, RESULTS_DIR
+from src.model_config import DEFAULT_MODEL, ModelConfig
 from experiments.runner import (
     capacity_from_spec,
     effective_page_size,
@@ -38,10 +39,12 @@ def main() -> None:
     p.add_argument("--tokenize-workers", type=int, default=0)
     p.add_argument("--max-requests", type=int, default=5000,
                    help="0 = full dataset")
-    p.add_argument("--mamba-state-token-equiv", type=int, default=1000,
-                   help="Token-equivalent cost of one Mamba SSM state (0 = pure attention mode)")
+    p.add_argument("--model", default=DEFAULT_MODEL.name,
+                   help=f"Model name ({', '.join(ModelConfig.list_models())})")
+    p.add_argument("--mamba-state-token-equiv", type=int, default=None,
+                   help="Token-equivalent cost of one Mamba SSM state (default: auto from model, 0 = pure attention)")
     p.add_argument("--kv-bytes-per-token", type=int, default=0,
-                   help="0 = use default from config")
+                   help="0 = use model default")
     p.add_argument("--out-csv", type=Path, default=None,
                    help="default: results/results.csv")
     p.add_argument("--out-json-dir", type=Path, default=None,
@@ -53,9 +56,11 @@ def main() -> None:
     if args.out_json_dir is None:
         args.out_json_dir = RESULTS_DIR / f"json_{args.dataset}"
 
-    kv_b = args.kv_bytes_per_token or KV_BYTES_PER_TOKEN_DEFAULT
+    model = ModelConfig.from_name(args.model)
+    kv_b = args.kv_bytes_per_token or model.kv_bytes_per_token
     page_size = effective_page_size(args.dataset, args.page_size)
     cap = capacity_from_spec(args.capacity, kv_b)
+    mamba = model.mamba_state_token_equiv if args.mamba_state_token_equiv is None else args.mamba_state_token_equiv
 
     reqs = prepare_requests(
         args.dataset,
@@ -68,10 +73,11 @@ def main() -> None:
     if not reqs:
         raise SystemExit(f"No requests loaded for dataset {args.dataset!r}")
 
-    strat = strategy_from_name(args.strategy)
+    strat = strategy_from_name(args.strategy, model=model)
     metrics = run_simulation(
         reqs, page_size, strat, cap,
-        mamba_state_token_equiv=args.mamba_state_token_equiv,
+        mamba_state_token_equiv=mamba,
+        model=model,
     )
 
     row = {
@@ -81,16 +87,19 @@ def main() -> None:
         "strategy": args.strategy,
         "capacity_spec": args.capacity,
         "tokenizer": args.tokenizer,
-        "mamba_state_token_equiv": args.mamba_state_token_equiv,
+        "mamba_state_token_equiv": mamba,
+        "model_name": model.name,
         "metrics": metrics.to_dict(),
     }
     persist_result_row(args.out_csv, args.out_json_dir, row)
+    flops_info = f" flops_save={metrics.flops_save_rate:.4f}" if metrics.flops_save_rate is not None else ""
     print(
         f"dataset={args.dataset} page_size={page_size} ordering={args.ordering} "
-        f"strategy={args.strategy} capacity={args.capacity} "
+        f"strategy={args.strategy} capacity={args.capacity} model={model.name} "
         f"token_hr={metrics.token_level_hit_rate:.4f} "
         f"page_hr={metrics.page_level_hit_rate:.4f} "
         f"turn_hr={metrics.turn_level_hit_rate:.4f}"
+        f"{flops_info}"
     )
 
 

@@ -32,14 +32,16 @@ from typing import List, Optional, Tuple
 
 from src.radix_tree import RadixNode, RadixTree
 from src.strategies.base import EvictOp, EvictionStrategy
-from src.strategies.marconi import (
+from src.model_config import (
+    DEFAULT_MODEL,
+    ModelConfig,
     _attn_flops,
     _kvs_size,
     _mamba1_flops,
     _mamba_state_size,
     _mlp_flops,
-    _normalize,
 )
+from src.strategies.marconi import _normalize
 
 # Minimum chain token length to place a mid-chain checkpoint.
 _MIN_CHAIN_TOKENS_FOR_MID_CHECKPOINT = 2048
@@ -72,12 +74,9 @@ class Marconi3Strategy(EvictionStrategy):
     use_mid_chain_checkpoint:
         If True (default), place a mid-chain mamba state at ~55% of long
         new chains.  Setting False disables this behaviour.
-    num_ssm_layers, num_attn_layers, num_mlp_layers:
-        Model layer counts for FLOP computation.
-    d:
-        Model hidden dimension.
-    n:
-        SSM state dimension.
+    model:
+        Model architecture configuration.  Provides layer counts, hidden
+        dimension, and SSM state dimension for FLOP computation.
     """
 
     def __init__(
@@ -85,20 +84,17 @@ class Marconi3Strategy(EvictionStrategy):
         alpha: float = 1.5,
         evict_mode: str = "ev0",
         use_mid_chain_checkpoint: bool = True,
-        num_ssm_layers: int = 48,
-        num_attn_layers: int = 16,
-        num_mlp_layers: int = 64,
-        d: int = 4096,
-        n: int = 128,
+        model: ModelConfig = DEFAULT_MODEL,
     ) -> None:
         self.alpha = alpha
         self.evict_mode = evict_mode
         self.use_mid_chain_checkpoint = use_mid_chain_checkpoint
-        self.num_ssm_layers = num_ssm_layers
-        self.num_attn_layers = num_attn_layers
-        self.num_mlp_layers = num_mlp_layers
-        self.d = d
-        self.n = n
+        self.model = model
+        self.num_ssm_layers = model.num_ssm_layers
+        self.num_attn_layers = model.num_attn_layers
+        self.num_mlp_layers = model.num_mlp_layers
+        self.d = model.d_model
+        self.n = model.ssm_state_dim
 
     @property
     def drop_partial_last_page(self) -> bool:
