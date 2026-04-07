@@ -17,6 +17,7 @@ Differences from Marconi (v1)
 
 from __future__ import annotations
 
+from collections import deque
 from typing import List, Optional, Tuple
 
 from src.radix_tree import RadixNode, RadixTree
@@ -25,27 +26,6 @@ from src.strategies.base import EvictOp, EvictionStrategy
 # Minimum chain token length to place a mid-chain checkpoint.
 _MIN_CHAIN_TOKENS_FOR_MID_CHECKPOINT = 2048
 
-
-def _depth_tokens(node: RadixNode) -> int:
-    """Total number of tokens on the path from root down to *node* (inclusive)."""
-    d = 0
-    n: RadixNode | None = node
-    while n is not None and n.parent is not None:
-        d += n.num_tokens
-        n = n.parent
-    return d
-
-
-def _depth_tokens_from_checkpoint(node: RadixNode) -> int:
-    """Token distance from the nearest ancestor with Mamba state (or root) to *node* (inclusive)."""
-    d = node.num_tokens
-    cur = node.parent
-    while cur is not None and cur.parent is not None:
-        if cur.has_mamba_state:
-            return d
-        d += cur.num_tokens
-        cur = cur.parent
-    return d
 
 
 def _estimate_leaf_free(leaf: RadixNode) -> int:
@@ -100,9 +80,34 @@ class Marconi2Strategy(EvictionStrategy):
     ) -> List[Tuple[float, RadixNode, EvictOp]]:
         """Score all eviction candidates on one axis.
 
+        Uses top-down BFS to compute depth_tokens and checkpoint-relative
+        depth inline, avoiding O(depth) parent walks per node.
+
         Returns list of ``(value_density, node, op)`` sorted ascending.
         """
         mte = tree.mamba_state_token_equiv
+        use_cp = self.use_checkpoint_relative_evict
+
+        # Top-down BFS: precompute depth_tokens and checkpoint-relative depth.
+        # node_depths maps node id -> (depth_tokens, depth_from_checkpoint)
+        node_depths: dict[int, Tuple[int, int]] = {}
+        q: deque[Tuple[RadixNode, int, int]] = deque()
+        for child in tree.root.children.values():
+            # tokens_from_checkpoint starts fresh from root
+            q.append((child, child.num_tokens, child.num_tokens))
+
+        while q:
+            node, depth_tokens, depth_from_cp = q.popleft()
+            node_depths[id(node)] = (depth_tokens, depth_from_cp)
+
+            # For children: if this node has mamba state, reset checkpoint distance
+            for ch in node.children.values():
+                ch_depth = depth_tokens + ch.num_tokens
+                if node.has_mamba_state:
+                    ch_from_cp = ch.num_tokens
+                else:
+                    ch_from_cp = depth_from_cp + ch.num_tokens
+                q.append((ch, ch_depth, ch_from_cp))
 
         leaf_candidates: List[RadixNode] = list(tree.leaf_node_set())
         mamba_candidates: List[RadixNode] = [
@@ -117,8 +122,10 @@ class Marconi2Strategy(EvictionStrategy):
             return []
 
         recencies = [n.last_access for n, _ in all_nodes]
-        depth_fn = _depth_tokens_from_checkpoint if self.use_checkpoint_relative_evict else _depth_tokens
-        depths = [depth_fn(n) for n, _ in all_nodes]
+        depths = [
+            node_depths[id(n)][1] if use_cp else node_depths[id(n)][0]
+            for n, _ in all_nodes
+        ]
 
         min_r, max_r = min(recencies), max(recencies)
         min_d, max_d = min(depths), max(depths)

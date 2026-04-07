@@ -25,7 +25,7 @@ from src.request_generator import (
     load_or_tokenize,
     order_requests,
 )
-from src.strategies import CRFDecouplingStrategy, FIFOStrategy, LFUStrategy, LRUStrategy, MarconiStrategy, Marconi2Strategy, EvictionStrategy
+from src.strategies import CRFDecouplingStrategy, FIFOStrategy, LFUStrategy, LRUStrategy, MarconiStrategy, Marconi2Strategy, Marconi3Strategy, EvictionStrategy
 
 
 def effective_page_size(dataset: str, page_size: int) -> int:
@@ -62,6 +62,18 @@ def strategy_from_name(name: str) -> EvictionStrategy:
         m = re.search(r"_a([\d.]+)", n)
         kwargs = {"alpha": float(m.group(1))} if m else {}
         return Marconi2Strategy(**kwargs)
+    # Marconi3 ablation variants: marconi3_e{0|1}_mn{0|1}[_a<float>]
+    m3_ablation = re.match(r"^marconi3_ev([d])_mn([01])", n)
+    if m3_ablation:
+        evict_mode = f"ev{m3_ablation.group(1)}"
+        use_mn = m3_ablation.group(2) == "1"
+        m_alpha = re.search(r"_a([\d.]+)", n[m3_ablation.end():])
+        kwargs = {"alpha": float(m_alpha.group(1))} if m_alpha else {}
+        return Marconi3Strategy(evict_mode=evict_mode, use_mid_chain_checkpoint=use_mn, **kwargs)
+    if n == "marconi3" or n.startswith("marconi3_"):
+        m = re.search(r"_a([\d.]+)", n)
+        kwargs = {"alpha": float(m.group(1))} if m else {}
+        return Marconi3Strategy(**kwargs)
     if n == "crf_decoupling" or n.startswith("crf_decoupling_"):
         # Optional lambda suffix: "crf_decoupling_0.01" → lambda_decay=0.01
         parts = n.split("_", 2)

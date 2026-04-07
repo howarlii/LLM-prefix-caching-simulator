@@ -11,56 +11,75 @@ Mamba SSM states are admitted at two types of high-value positions:
    second branch off an existing tree node, that node becomes a fork
    (shared prefix split).
 
-Eviction (FLOP-aware, unified)
-------------------------------
-All eviction candidates — both Mamba-state demotions and full leaf
-removals — are scored on one axis:
+Eviction (FLOP-aware, aligned with original Marconi paper)
+----------------------------------------------------------
+All nodes with ``len(children) <= 1`` (excluding root) are candidates.
+Each is scored on one axis:
 
-    value_density = raw_score / capacity_freed
+    score = alpha * norm_flop_eff + norm_recency
 
-where ``raw_score = recency + alpha * flop_efficiency`` (both normalised
-to [0, 1]).  The candidate with the **lowest** value density is evicted.
+The candidate with the **lowest** score is evicted.
 
-* ``recency(n)`` – normalised ``last_access`` timestamp.
-* ``flop_efficiency(n)`` – normalised cumulative token depth from root
-  to *n* (higher = longer sequence = more FLOPs saved).
+* ``recency(n)`` – ``1 / (current_ts - last_access)``, normalised to [0, 1].
+* ``flop_efficiency(n)`` – incremental FLOPs saved (relative to parent)
+  divided by total memory cost of the path, normalised to [0, 1].
+  Matches the original ``radix_cache_hybrid.evict_v2`` formula including
+  the MLP bug (uses ``get_attn_flops`` instead of ``get_mlp_flops`` for
+  the parent subtraction term).
 
-Candidate sets:
-* Mamba-state demotion: ``has_mamba_state and len(children) <= 1``.
-  Frees ``mamba_state_token_equiv`` capacity.
-* Leaf removal: leaf nodes.  Frees page tokens (+ pruned chain).
+Candidate operations:
+* Leaf nodes (``len(children) == 0``): removed entirely.
+* Single-child nodes with Mamba state: Mamba state demoted.
+* Single-child nodes without Mamba state: treated as leaf removal.
 """
 
 from __future__ import annotations
 
+from collections import deque
 from typing import List, Optional, Tuple
 
 from src.radix_tree import RadixNode, RadixTree
 from src.strategies.base import EvictOp, EvictionStrategy
 
 
-def _depth_tokens(node: RadixNode) -> int:
-    """Total number of tokens on the path from root down to *node* (inclusive)."""
-    d = 0
-    n: RadixNode | None = node
-    while n is not None and n.parent is not None:
-        d += n.num_tokens
-        n = n.parent
-    return d
+# ---------------------------------------------------------------------------
+# FLOP / memory helpers (matching marconi/utils.py exactly)
+# ---------------------------------------------------------------------------
+
+def _attn_flops(l: int, d: int) -> float:
+    """Attention block FLOPs: 8·L·D² + 4·L²·D."""
+    return 8 * l * d ** 2 + 4 * l ** 2 * d
 
 
-def _estimate_leaf_free(leaf: RadixNode) -> int:
-    """Estimate tokens freed by removing a leaf and pruning its empty chain."""
-    total = leaf.num_tokens
-    cur = leaf.parent
-    while cur is not None and cur.parent is not None:
-        if len(cur.children) > 1:
-            break
-        if cur.has_mamba_state:
-            break
-        total += cur.num_tokens
-        cur = cur.parent
-    return total
+def _mlp_flops(l: int, d: int) -> float:
+    """MLP block FLOPs: 16·L·D²."""
+    return 16 * l * d ** 2
+
+
+def _mamba1_flops(l: int, d: int, n: int) -> float:
+    """Mamba-1 layer FLOPs: 12·L·D² + 16·L·D·N + 10·L·D."""
+    return 12 * l * d ** 2 + 16 * l * d * n + 10 * l * d
+
+
+def _kvs_size(l: int, d: int) -> float:
+    """KV cache size in bytes for one attention layer: 2·L·D·2."""
+    return 2 * l * d * 2
+
+
+def _mamba_state_size(d: int, n: int, conv_kernel: int = 4, expand: int = 2) -> float:
+    """SSM + conv state size in bytes for one SSM layer."""
+    return d * n * 2 + (expand * d + 2 * n) * conv_kernel * 2
+
+
+
+def _normalize(values: List[float], default: float = 1.0) -> List[float]:
+    """Min-max normalisation matching the original Marconi ``_normalize``."""
+    if len(values) > 1:
+        min_val = min(values)
+        max_val = max(values)
+        if min_val != max_val:
+            return [(v - min_val) / (max_val - min_val) for v in values]
+    return [default] * len(values)
 
 
 class MarconiStrategy(EvictionStrategy):
@@ -71,10 +90,29 @@ class MarconiStrategy(EvictionStrategy):
     alpha:
         Weight for the FLOP-efficiency term in the eviction score.
         Higher values favour retaining long-sequence Mamba states.
+    num_ssm_layers, num_attn_layers, num_mlp_layers:
+        Model layer counts for FLOP computation.
+    d:
+        Model hidden dimension.
+    n:
+        SSM state dimension.
     """
 
-    def __init__(self, alpha: float = 1.5) -> None:
+    def __init__(
+        self,
+        alpha: float = 1.5,
+        num_ssm_layers: int = 48,
+        num_attn_layers: int = 16,
+        num_mlp_layers: int = 64,
+        d: int = 4096,
+        n: int = 128,
+    ) -> None:
         self.alpha = alpha
+        self.num_ssm_layers = num_ssm_layers
+        self.num_attn_layers = num_attn_layers
+        self.num_mlp_layers = num_mlp_layers
+        self.d = d
+        self.n = n
 
     @property
     def drop_partial_last_page(self) -> bool:
@@ -101,50 +139,95 @@ class MarconiStrategy(EvictionStrategy):
             tree.set_mamba_state(parent)
 
     # ------------------------------------------------------------------
+    # FLOP efficiency per node (original Marconi formula)
+    # ------------------------------------------------------------------
+
+    def _node_flops_efficiency_fast(
+        self, seqlen_total: int, seqlen_parent: int
+    ) -> float:
+        """FLOP efficiency with precomputed depth values (no tree walk)."""
+        seqlen_child = seqlen_total - seqlen_parent
+
+        d, n = self.d, self.n
+
+        flops_mamba = self.num_ssm_layers * _mamba1_flops(seqlen_child, d, n)
+        flops_attn = self.num_attn_layers * (_attn_flops(seqlen_total, d) - _attn_flops(seqlen_parent, d))
+        # Original bug: mlp parent term uses _attn_flops instead of _mlp_flops
+        flops_mlp = self.num_mlp_layers * (_mlp_flops(seqlen_total, d) - _attn_flops(seqlen_parent, d))
+        total_flops_savings = flops_mamba + flops_attn + flops_mlp
+
+        total_memory = (
+            self.num_ssm_layers * _mamba_state_size(d, n)
+            + self.num_attn_layers * _kvs_size(seqlen_total, d)
+        )
+        if total_memory == 0:
+            return 0.0
+        return total_flops_savings / total_memory
+
+    # ------------------------------------------------------------------
     # Unified eviction
     # ------------------------------------------------------------------
 
     def _collect_and_score(
         self, tree: RadixTree
     ) -> List[Tuple[float, RadixNode, EvictOp]]:
-        """Score all eviction candidates on one axis.
+        """Score candidates using the original Marconi formula.
 
-        Returns list of ``(value_density, node, op)`` sorted ascending.
+        Uses top-down BFS to compute depth_tokens and checkpoint_depth
+        inline, avoiding O(depth) parent walks per node.
+
+        score = alpha * norm_flop_eff + norm_recency
+        (lower score → evict first)
         """
-        mte = tree.mamba_state_token_equiv
+        current_ts = tree.clock
 
-        leaf_candidates: List[RadixNode] = list(tree.leaf_node_set())
-        mamba_candidates: List[RadixNode] = [
-            n for n in tree.mamba_state_node_set() if len(n.children) <= 1
-        ]
+        # Top-down BFS: compute depth_tokens and checkpoint_depth as we go.
+        # Each queue entry: (node, depth_tokens, checkpoint_depth)
+        # checkpoint_depth = depth_tokens of nearest ancestor with mamba state (0 = root)
+        candidates: List[Tuple[RadixNode, EvictOp, int, int]] = []
+        q: deque[Tuple[RadixNode, int, int]] = deque()
+        for child in tree.root.children.values():
+            q.append((child, child.num_tokens, 0))
 
-        all_nodes: List[Tuple[RadixNode, EvictOp]] = (
-            [(n, "mamba") for n in mamba_candidates]
-            + [(n, "leaf") for n in leaf_candidates]
-        )
-        if not all_nodes:
+        while q:
+            node, depth_tokens, checkpoint_depth = q.popleft()
+
+            # Checkpoint depth for *children* of this node
+            child_checkpoint = depth_tokens if node.has_mamba_state else checkpoint_depth
+
+            num_ch = len(node.children)
+            if num_ch == 0:
+                candidates.append((node, "leaf", depth_tokens, checkpoint_depth))
+            elif node.has_mamba_state:
+                candidates.append((node, "mamba", depth_tokens, checkpoint_depth))
+
+            for ch in node.children.values():
+                q.append((ch, depth_tokens + ch.num_tokens, child_checkpoint))
+
+        if not candidates:
             return []
 
-        recencies = [n.last_access for n, _ in all_nodes]
-        depths = [_depth_tokens(n) for n, _ in all_nodes]
+        # --- Recency: 1 / (current_ts - ts), higher = hotter ---
+        recency_values = [
+            1.0 / max(current_ts - n.last_access, 1)
+            for n, _, _, _ in candidates
+        ]
 
-        min_r, max_r = min(recencies), max(recencies)
-        min_d, max_d = min(depths), max(depths)
+        # --- FLOP efficiency with precomputed depths (no parent walk) ---
+        flop_eff_values = [
+            self._node_flops_efficiency_fast(dt, cp)
+            for _, _, dt, cp in candidates
+        ]
 
+        # --- Normalise both to [0, 1] ---
+        norm_recency = _normalize(recency_values)
+        norm_flop_eff = _normalize(flop_eff_values)
+
+        # --- Score: alpha * eff + recency (lower → evict first) ---
         scored: List[Tuple[float, RadixNode, EvictOp]] = []
-        for (n, op), r, d in zip(all_nodes, recencies, depths):
-            norm_r = (r - min_r) / (max_r - min_r) if max_r > min_r else 0.0
-            norm_d = (d - min_d) / (max_d - min_d) if max_d > min_d else 0.0
-            raw_score = norm_r + self.alpha * norm_d
-
-            if op == "mamba":
-                freed = max(mte, 1)
-            else:
-                freed = max(_estimate_leaf_free(n), 1)
-                if n.has_mamba_state:
-                    freed += mte
-
-            scored.append((raw_score / freed, n, op))
+        for (n, op, _, _), rec, eff in zip(candidates, norm_recency, norm_flop_eff):
+            score = self.alpha * eff + rec
+            scored.append((score, n, op))
 
         scored.sort(key=lambda x: x[0])
         return scored

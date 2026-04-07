@@ -7,6 +7,7 @@ from src.strategies.lfu import LFUStrategy
 from src.strategies.lru import LRUStrategy
 from src.strategies.marconi import MarconiStrategy
 from src.strategies.marconi2 import Marconi2Strategy
+from src.strategies.marconi3 import Marconi3Strategy
 
 __all__ = [
     "EvictionStrategy",
@@ -16,4 +17,5 @@ __all__ = [
     "FIFOStrategy",
     "MarconiStrategy",
     "Marconi2Strategy",
+    "Marconi3Strategy",
 ]
