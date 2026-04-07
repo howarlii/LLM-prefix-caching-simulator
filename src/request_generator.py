@@ -18,7 +18,7 @@ from tqdm import tqdm
 from src.config import DEFAULT_TOKENIZER_NAME, TOKEN_CACHE_DIR, ensure_cpu_only
 from src.datasets_loader import RawRequest
 
-OrderingName = Literal["original", "min_distance", "max_distance", "random"]
+OrderingName = Literal["original", "min_distance", "max_distance", "random", "timestamp"]
 
 
 @dataclass
@@ -313,8 +313,15 @@ def order_requests(
     items: List[TokenizedRequest],
     mode: OrderingName,
     seed: int = 0,
+    *,
+    sessions_per_second: float = 1.0,
+    words_per_min: float = 90.0,
 ) -> List[TokenizedRequest]:
-    """Reorder tokenized requests for cache-distance experiments."""
+    """Reorder tokenized requests for cache-distance experiments.
+
+    Parameters ``sessions_per_second`` and ``words_per_min`` are only used by
+    the ``"timestamp"`` ordering.
+    """
     if mode == "original":
         return list(items)
 
@@ -363,4 +370,54 @@ def order_requests(
                 break
         return out
 
+    if mode == "timestamp":
+        return _order_by_timestamp(
+            by_g, groups, sessions_per_second=sessions_per_second,
+            words_per_min=words_per_min,
+        )
+
     raise ValueError(f"Unknown ordering {mode!r}")
+
+
+# ── Timestamp ordering ──────────────────────────────────────────────────────
+
+# Rough tokens-per-word ratio for estimating typing latency from token counts.
+_TOKENS_PER_WORD = 1.3
+
+
+def _order_by_timestamp(
+    by_g: Dict[str, List[TokenizedRequest]],
+    groups: List[str],
+    *,
+    sessions_per_second: float,
+    words_per_min: float,
+) -> List[TokenizedRequest]:
+    """Simulate realistic arrival timestamps and sort globally.
+
+    Follows the approach from marconi's ``generate_sharegpt_trace``:
+    - Each session (group) starts at ``session_index / sessions_per_second``.
+    - Subsequent turns within a session are delayed by the estimated user
+      typing time: ``new_tokens / tokens_per_word / words_per_second``.
+    - All requests are then sorted by their assigned timestamp.
+    """
+    words_per_second = words_per_min / 60.0
+    tagged: List[Tuple[float, int, TokenizedRequest]] = []  # (ts, global_idx, req)
+    global_idx = 0
+
+    for session_idx, g in enumerate(sorted(groups)):
+        curr_ts = session_idx / sessions_per_second
+        prev_len = 0
+        for req in by_g[g]:
+            cur_len = len(req.token_ids)
+            if prev_len > 0:
+                # New tokens in this turn approximate the user's input length.
+                new_tokens = max(cur_len - prev_len, 0)
+                estimated_words = new_tokens / _TOKENS_PER_WORD
+                typing_latency = estimated_words / words_per_second
+                curr_ts += typing_latency
+            tagged.append((curr_ts, global_idx, req))
+            global_idx += 1
+            prev_len = cur_len
+
+    tagged.sort(key=lambda t: (t[0], t[1]))
+    return [req for _, _, req in tagged]

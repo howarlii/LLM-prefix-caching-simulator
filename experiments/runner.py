@@ -11,14 +11,19 @@ from typing import Any, Dict, List, Optional, cast
 
 from tqdm import tqdm
 
-from src.cache_simulator import KVCacheSimulator
+from src.cache_simulator import KVCacheSimulator, MultiTierCacheSimulator
 from src.config import (
     DEFAULT_TOKENIZER_NAME,
     gb_to_token_capacity,
     ensure_hf_cache_dirs,
 )
 from src.datasets_loader import is_mooncake_trace_dataset, load_raw_requests
-from src.metrics import RunMetrics, compute_run_metrics
+from src.metrics import (
+    MultiTierRunMetrics,
+    RunMetrics,
+    compute_multi_tier_run_metrics,
+    compute_run_metrics,
+)
 from src.model_config import DEFAULT_MODEL, ModelConfig
 from src.request_generator import (
     OrderingName,
@@ -100,20 +105,46 @@ def run_simulation(
     page_size: int,
     strategy: EvictionStrategy,
     capacity_tokens: Optional[int],
-    mamba_state_token_equiv: int = 0,
     logger: object = None,
     model: Optional[ModelConfig] = None,
 ) -> RunMetrics:
+    mamba = model.mamba_state_token_equiv if model is not None else 0
     sim = KVCacheSimulator(
         page_size=page_size,
         strategy=strategy,
         capacity_tokens=capacity_tokens,
-        mamba_state_token_equiv=mamba_state_token_equiv,
+        mamba_state_token_equiv=mamba,
         logger=logger,
     )
     for req in tqdm(requests, desc="Simulating", leave=False, disable=not sys.stderr.isatty()):
         sim.process_token_ids(req.token_ids)
     return compute_run_metrics(sim.state, sim.tree, model=model)
+
+
+def run_multi_tier_simulation(
+    requests: List[TokenizedRequest],
+    page_size: int,
+    hbm_strategy: EvictionStrategy,
+    dram_strategy: EvictionStrategy,
+    hbm_capacity_tokens: int,
+    dram_capacity_tokens: int,
+    model: Optional[ModelConfig] = None,
+) -> MultiTierRunMetrics:
+    """Run a two-tier (HBM + DRAM) cache simulation."""
+    mamba = model.mamba_state_token_equiv if model is not None else 0
+    sim = MultiTierCacheSimulator(
+        page_size=page_size,
+        hbm_strategy=hbm_strategy,
+        dram_strategy=dram_strategy,
+        hbm_capacity_tokens=hbm_capacity_tokens,
+        dram_capacity_tokens=dram_capacity_tokens,
+        mamba_state_token_equiv=mamba,
+    )
+    for req in tqdm(requests, desc="Simulating (multi-tier)", leave=False, disable=not sys.stderr.isatty()):
+        sim.process_token_ids(req.token_ids)
+    return compute_multi_tier_run_metrics(
+        sim.state, sim.hbm_tree, sim.dram_tree, model=model
+    )
 
 
 RESULT_CSV_FIELDS: List[str] = [
@@ -138,6 +169,8 @@ RESULT_CSV_FIELDS: List[str] = [
     "peak_cached_tokens",
     "avg_cached_tokens",
     "total_input_tokens",
+    "req_branch_rate",
+    "req_new_branch_rate",
     "flops_save_rate",
     "total_flops_no_cache",
     "total_flops_with_cache",
@@ -183,6 +216,8 @@ def persist_result_row(
         "peak_cached_tokens": metrics.get("peak_cached_tokens"),
         "avg_cached_tokens": metrics.get("avg_cached_tokens"),
         "total_input_tokens": metrics.get("total_input_tokens"),
+        "req_branch_rate": metrics.get("req_branch_rate"),
+        "req_new_branch_rate": metrics.get("req_new_branch_rate"),
         "flops_save_rate": metrics.get("flops_save_rate"),
         "total_flops_no_cache": metrics.get("total_flops_no_cache"),
         "total_flops_with_cache": metrics.get("total_flops_with_cache"),
@@ -197,7 +232,15 @@ def persist_result_row(
     if out_csv.is_file():
         with out_csv.open("r", newline="", encoding="utf-8") as f:
             reader = csv.DictReader(f)
+            old_fields = list(reader.fieldnames or [])
             existing = list(reader)
+
+        # Merge headers: keep RESULT_CSV_FIELDS order, then append any
+        # old columns not present in RESULT_CSV_FIELDS (preserves extras).
+        merged_fields = list(RESULT_CSV_FIELDS)
+        for f in old_fields:
+            if f not in merged_fields:
+                merged_fields.append(f)
 
         replaced = False
         for i, r in enumerate(existing):
@@ -210,9 +253,9 @@ def persist_result_row(
             existing.append(new_row)
 
         with out_csv.open("w", newline="", encoding="utf-8") as f:
-            w = csv.DictWriter(f, fieldnames=RESULT_CSV_FIELDS, extrasaction="ignore")
+            w = csv.DictWriter(f, fieldnames=merged_fields, extrasaction="ignore")
             w.writeheader()
-            w.writerows({k: r.get(k, "") for k in RESULT_CSV_FIELDS} for r in existing)
+            w.writerows({k: r.get(k, "") for k in merged_fields} for r in existing)
     else:
         out_csv.parent.mkdir(parents=True, exist_ok=True)
         with out_csv.open("w", newline="", encoding="utf-8") as f:
@@ -232,6 +275,8 @@ def prepare_requests(
     tokenize_workers: int = 0,
     force_retokenize: bool = False,
     max_requests: Optional[int] = None,
+    sessions_per_second: float = 1.0,
+    words_per_min: float = 90.0,
 ) -> List[TokenizedRequest]:
     ensure_hf_cache_dirs()
     raw = load_raw_requests(
@@ -244,6 +289,14 @@ def prepare_requests(
         return []
     if max_requests is not None:
         raw = raw[:max_requests]
+
+    order_kw = dict(
+        mode=cast(OrderingName, ordering),
+        seed=seed,
+        sessions_per_second=sessions_per_second,
+        words_per_min=words_per_min,
+    )
+
     if is_mooncake_trace_dataset(dataset):
         tok_moon: List[TokenizedRequest] = []
         for r in raw:
@@ -259,7 +312,7 @@ def prepare_requests(
                     meta=meta,
                 )
             )
-        return order_requests(tok_moon, mode=cast(OrderingName, ordering), seed=seed)
+        return order_requests(tok_moon, **order_kw)
     tok = load_or_tokenize(
         dataset,
         raw,
@@ -267,4 +320,4 @@ def prepare_requests(
         num_workers=tokenize_workers,
         force_recompute=force_retokenize,
     )
-    return order_requests(tok, mode=cast(OrderingName, ordering), seed=seed)
+    return order_requests(tok, **order_kw)

@@ -28,6 +28,22 @@ from typing import Dict, Iterator, List, Optional, Set, Tuple
 PageKey = Tuple[int, ...]
 
 
+def node_page_path(node: "RadixNode") -> List[PageKey]:
+    """Reconstruct the full page sequence from root to *node* (inclusive).
+
+    Walks parent pointers from *node* up to the root, collects each node's
+    ``pages`` tuple, reverses, and flattens into a single page list.
+    The root node (empty pages) is excluded.
+    """
+    segments: List[Tuple[PageKey, ...]] = []
+    cur = node
+    while cur is not None and cur.pages:
+        segments.append(cur.pages)
+        cur = cur.parent
+    segments.reverse()
+    return [p for seg in segments for p in seg]
+
+
 @dataclass
 class RadixNode:
     """One node = one or more consecutive cached pages."""
@@ -221,7 +237,7 @@ class RadixTree:
 
     def simulate_request(
         self, pages: List[PageKey]
-    ) -> Tuple[int, int, int, int, List[RadixNode], List[RadixNode]]:
+    ) -> Tuple[int, int, int, int, List[RadixNode], List[RadixNode], bool, bool]:
         """Match longest page prefix, touch hit nodes, insert missing suffix.
 
         Returns
@@ -232,6 +248,10 @@ class RadixTree:
         turn_hit_tokens : int
         new_nodes : List[RadixNode]
         matched_nodes : List[RadixNode]
+        is_branch : bool
+            True if new nodes were inserted at a non-leaf (branching) point.
+        is_new_branch : bool
+            True if *is_branch* and the branch-point node has no Mamba state.
         """
         self._clock += 1
         ts = self._clock
@@ -310,6 +330,8 @@ class RadixTree:
         # Insert remaining suffix as a single compressed node.
         new_nodes: List[RadixNode] = []
         remaining = pages[page_idx:]
+        is_branch = bool(remaining) and len(node.children) > 0
+        is_new_branch = is_branch and not node.has_mamba_state
         if remaining:
             self._leaf_set.discard(node)
             order = self._next_creation_order()
@@ -329,7 +351,7 @@ class RadixTree:
         node.is_turn_end = True
 
         total_tokens = sum(len(x) for x in pages)
-        return hit_pages, hit_tokens, total_tokens, turn_hit_tokens, new_nodes, matched_nodes
+        return hit_pages, hit_tokens, total_tokens, turn_hit_tokens, new_nodes, matched_nodes, is_branch, is_new_branch
 
     # ------------------------------------------------------------------
     # Leaf / mamba accessors (backed by incremental indexes)
@@ -350,6 +372,133 @@ class RadixTree:
     def mamba_state_node_set(self) -> Set[RadixNode]:
         """Direct access to the mamba state node set (read-only view — do not mutate)."""
         return self._mamba_state_nodes
+
+    # ------------------------------------------------------------------
+    # Read-only prefix match (no insertion, no clock advance)
+    # ------------------------------------------------------------------
+
+    def prefix_match(
+        self, pages: List[PageKey]
+    ) -> Tuple[int, int, List[RadixNode]]:
+        """Match longest page prefix without inserting or advancing clock.
+
+        Returns
+        -------
+        matched_pages : int
+        matched_tokens : int
+        matched_nodes : List[RadixNode]
+        """
+        node = self._root
+        matched_nodes: List[RadixNode] = []
+        page_idx = 0
+
+        while page_idx < len(pages):
+            ch = node.children.get(pages[page_idx])
+            if ch is None:
+                break
+
+            ch_pages = ch.pages
+            match_len = 0
+            for i in range(len(ch_pages)):
+                if page_idx + i >= len(pages) or pages[page_idx + i] != ch_pages[i]:
+                    break
+                match_len += 1
+            else:
+                match_len = len(ch_pages)
+
+            if match_len == len(ch_pages):
+                matched_nodes.append(ch)
+                node = ch
+                page_idx += len(ch_pages)
+            elif match_len > 0:
+                # Partial match — don't split (read-only), count partial pages.
+                # We report matched pages up to the partial match boundary.
+                # Since we can't split, we report the full-node matches so far.
+                break
+            else:
+                break
+
+        total_pages = sum(n.num_pages for n in matched_nodes)
+        total_tokens = sum(n.num_tokens for n in matched_nodes)
+        return total_pages, total_tokens, matched_nodes
+
+    # ------------------------------------------------------------------
+    # Insert pages (for demotion / external insertion, no clock advance)
+    # ------------------------------------------------------------------
+
+    def insert_pages(
+        self,
+        pages: List[PageKey],
+        timestamp: int = 0,
+        access_count: int = 1,
+    ) -> List[RadixNode]:
+        """Insert a page sequence into the tree without advancing the clock.
+
+        Walks the tree to find the longest existing prefix, then inserts the
+        remaining suffix as a new compressed node.  Existing nodes along the
+        matched prefix are *not* touched (their ``last_access`` / ``access_count``
+        are left unchanged).
+
+        Parameters
+        ----------
+        pages:
+            Full page sequence from root to leaf.
+        timestamp:
+            ``last_access`` value to assign to newly created nodes.
+        access_count:
+            ``access_count`` value to assign to newly created nodes.
+
+        Returns
+        -------
+        new_nodes : List[RadixNode]
+            Newly created nodes (empty if fully matched).
+        """
+        node = self._root
+        page_idx = 0
+
+        while page_idx < len(pages):
+            ch = node.children.get(pages[page_idx])
+            if ch is None:
+                break
+
+            ch_pages = ch.pages
+            match_len = 0
+            for i in range(len(ch_pages)):
+                if page_idx + i >= len(pages) or pages[page_idx + i] != ch_pages[i]:
+                    break
+                match_len += 1
+            else:
+                match_len = len(ch_pages)
+
+            if match_len == len(ch_pages):
+                node = ch
+                page_idx += len(ch_pages)
+            else:
+                # Partial match — split the existing node.
+                self.split_node(ch, match_len)
+                node = ch  # ch is now the prefix after split
+                page_idx += match_len
+                break
+
+        new_nodes: List[RadixNode] = []
+        remaining = pages[page_idx:]
+        if remaining:
+            self._leaf_set.discard(node)
+            order = self._next_creation_order()
+            child = RadixNode(
+                pages=tuple(remaining),
+                num_tokens=sum(len(p) for p in remaining),
+                parent=node,
+                creation_order=order,
+                last_access=timestamp,
+                access_count=access_count,
+            )
+            node.children[remaining[0]] = child
+            self._add_token_count(child.num_tokens)
+            new_nodes.append(child)
+            self._leaf_set.add(child)
+
+        return new_nodes
 
     # ------------------------------------------------------------------
     # Removal

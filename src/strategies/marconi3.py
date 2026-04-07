@@ -211,6 +211,10 @@ class Marconi3Strategy(EvictionStrategy):
         """
         return self._prefill_flops(depth_tokens) - self._prefill_flops(checkpoint_depth)
 
+    def _mamba_memory_occupy(self) -> float:
+        d, n = self.d, self.n
+        return self.num_ssm_layers * _mamba_state_size(d, n)
+
     def _node_memory_occupy(
         self, depth_tokens: int, checkpoint_depth: int, has_mamba: bool
     ) -> float:
@@ -219,7 +223,7 @@ class Marconi3Strategy(EvictionStrategy):
         kv_tokens = depth_tokens - checkpoint_depth
         mem = self.num_attn_layers * _kvs_size(kv_tokens, d)
         if has_mamba:
-            mem += self.num_ssm_layers * _mamba_state_size(d, n)
+            mem += self._mamba_memory_occupy()
         return mem
 
     # ------------------------------------------------------------------
@@ -293,8 +297,9 @@ class Marconi3Strategy(EvictionStrategy):
 
         scored: List[Tuple[float, RadixNode, EvictOp]] = []
         for (n, op, _, _), rec, eff in zip(candidates, norm_recency, norm_flop_eff):
-            score = self.alpha * eff + rec
-            scored.append((score, n, op))
+            if op == "leaf":
+                score = self.alpha * eff + rec
+                scored.append((score, n, op))
 
         scored.sort(key=lambda x: x[0])
         return scored
@@ -312,20 +317,21 @@ class Marconi3Strategy(EvictionStrategy):
         recencies = [n.last_access for n, _, _, _ in candidates]
 
         flop_eff_values = []
-        for n, _, dt, cp in candidates:
+        for n, op, dt, cp in candidates:
             flops = self._node_flops_savings(dt, cp)
-            mem = self._node_memory_occupy(dt, cp, n.has_mamba_state)
+            if op == "leaf":
+                mem = self._node_memory_occupy(dt, cp, n.has_mamba_state)
+            else:
+                mem = self._mamba_memory_occupy()
             flop_eff_values.append(flops / mem if mem > 0 else 0.0)
 
-        min_r, max_r = min(recencies), max(recencies)
-        min_d, max_d = min(flop_eff_values), max(flop_eff_values)
+        norm_recency = _normalize(recencies)
+        norm_flop_eff = _normalize(flop_eff_values)
 
         scored: List[Tuple[float, RadixNode, EvictOp]] = []
-        for (n, op, _, _), r, d in zip(candidates, recencies, flop_eff_values):
-            norm_r = (r - min_r) / (max_r - min_r) if max_r > min_r else 0.0
-            norm_d = (d - min_d) / (max_d - min_d) if max_d > min_d else 0.0
-            raw_score = norm_r + self.alpha * norm_d
-            scored.append((raw_score, n, op))
+        for (n, op, _, _), rec, eff in zip(candidates, norm_recency, norm_flop_eff):
+            score = self.alpha * eff + rec
+            scored.append((score, n, op))
 
         scored.sort(key=lambda x: x[0])
         return scored

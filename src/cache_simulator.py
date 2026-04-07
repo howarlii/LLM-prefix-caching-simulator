@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import List, Optional
 
-from src.radix_tree import PageKey, RadixTree
+from src.radix_tree import PageKey, RadixTree, node_page_path
 from src.strategies.base import EvictionStrategy
 
 
@@ -28,6 +28,8 @@ class RequestTrace:
     hit_pages: int
     total_pages: int
     turn_hit_tokens: int
+    is_branch: bool = False
+    is_new_branch: bool = False
 
     @property
     def miss_tokens(self) -> int:
@@ -105,7 +107,7 @@ class KVCacheSimulator:
             and len(pages[-1]) < self.page_size
         ):
             pages = pages[:-1]
-        hit_pages, hit_tokens, total_tokens, turn_hit_tokens, new_nodes, matched_nodes = (
+        hit_pages, hit_tokens, total_tokens, turn_hit_tokens, new_nodes, matched_nodes, is_branch, is_new_branch = (
             self.tree.simulate_request(pages)
         )
 
@@ -161,6 +163,8 @@ class KVCacheSimulator:
             hit_pages=hit_pages,
             total_pages=len(pages),
             turn_hit_tokens=turn_hit_tokens,
+            is_branch=is_branch,
+            is_new_branch=is_new_branch,
         )
         self._evict_until_fit()
 
@@ -191,15 +195,211 @@ class KVCacheSimulator:
                     log.evict(removed)
 
 
+@dataclass
+class MultiTierRequestTrace:
+    """Per-request statistics for two-tier (HBM + DRAM) cache."""
+
+    input_tokens: int
+    hit_tokens: int          # effective total = hbm + dram hits
+    hit_pages: int
+    total_pages: int
+    turn_hit_tokens: int
+    hbm_hit_tokens: int
+    dram_hit_tokens: int
+    promoted_tokens: int     # DRAM → HBM this request
+    promoted_nodes: int
+    demoted_tokens: int      # HBM → DRAM this request
+    demoted_nodes: int
+    is_branch: bool = False
+    is_new_branch: bool = False
+
+    @property
+    def miss_tokens(self) -> int:
+        return self.input_tokens - self.hit_tokens
+
+    @property
+    def per_request_token_hit_rate(self) -> float:
+        if self.input_tokens == 0:
+            return 0.0
+        return self.hit_tokens / self.input_tokens
+
+
+@dataclass
+class MultiTierSimulationState:
+    """Accumulated counters for a multi-tier simulation run."""
+
+    traces: List[MultiTierRequestTrace] = field(default_factory=list)
+    hbm_usage_samples: List[int] = field(default_factory=list)
+    dram_usage_samples: List[int] = field(default_factory=list)
+
+    def record_trace(
+        self,
+        t: MultiTierRequestTrace,
+        hbm_cached_after: int,
+        dram_cached_after: int,
+    ) -> None:
+        self.traces.append(t)
+        self.hbm_usage_samples.append(hbm_cached_after)
+        self.dram_usage_samples.append(dram_cached_after)
+
+
 class MultiTierCacheSimulator:
-    """Placeholder for a two-level host-memory cache (not implemented)."""
+    """Two-tier prefix KV cache: HBM (fast/small) + DRAM (slow/large).
 
-    def __init__(self, *args: object, **kwargs: object) -> None:
-        self._args = args
-        self._kwargs = kwargs
+    Each tier maintains an independent :class:`RadixTree` with its own
+    eviction strategy and capacity.  The DRAM tier is **inclusive** — it
+    may contain prefix paths that also exist in HBM, which keeps the
+    implementation simple (each tree is self-contained).
 
-    def process_token_ids(self, token_ids: List[int]) -> RequestTrace:
-        raise NotImplementedError(
-            "Multi-tier cache simulation is reserved for future work; "
-            "use KVCacheSimulator for single-tier experiments."
+    Lookup flow per request:
+      1. Match + insert in the HBM tree (primary).
+      2. Read-only prefix match in the DRAM tree for additional depth.
+      3. Effective hit = HBM hits + extra DRAM hits beyond HBM depth.
+      4. Evict HBM excess → demote evicted leaf paths to DRAM.
+      5. Evict DRAM excess → discard.
+
+    Parameters
+    ----------
+    page_size:
+        Tokens per cache page.
+    hbm_strategy / dram_strategy:
+        Eviction strategies for each tier.
+    hbm_capacity_tokens / dram_capacity_tokens:
+        Maximum token-equivalent capacity per tier.
+    """
+
+    def __init__(
+        self,
+        page_size: int,
+        hbm_strategy: EvictionStrategy,
+        dram_strategy: EvictionStrategy,
+        hbm_capacity_tokens: int,
+        dram_capacity_tokens: int,
+        mamba_state_token_equiv: int = 0,
+    ) -> None:
+        self.page_size = page_size
+        self.hbm_strategy = hbm_strategy
+        self.dram_strategy = dram_strategy
+        self.hbm_capacity = hbm_capacity_tokens
+        self.dram_capacity = dram_capacity_tokens
+        self.mamba_state_token_equiv = mamba_state_token_equiv
+
+        self.hbm_tree = RadixTree(mamba_state_token_equiv=mamba_state_token_equiv)
+        self.dram_tree = RadixTree(mamba_state_token_equiv=mamba_state_token_equiv)
+        self.state = MultiTierSimulationState()
+        self._request_count = 0
+
+    # -- public API -------------------------------------------------------
+
+    def process_token_ids(self, token_ids: List[int]) -> MultiTierRequestTrace:
+        pages = tokens_to_pages(token_ids, self.page_size)
+        if (
+            self.hbm_strategy.drop_partial_last_page
+            and len(pages) > 1
+            and len(pages[-1]) < self.page_size
+        ):
+            pages = pages[:-1]
+
+        self._request_count += 1
+
+        # ── Step 1: HBM lookup + insert suffix ──────────────────────
+        hbm_hit_pages, hbm_hit_tokens, total_tokens, turn_hit_tokens, hbm_new, hbm_matched, _is_branch, _is_new_branch = (
+            self.hbm_tree.simulate_request(pages)
         )
+        if hbm_matched:
+            self.hbm_strategy.on_cache_hit(self.hbm_tree, hbm_matched)
+        if hbm_new:
+            self.hbm_strategy.on_new_nodes_inserted(self.hbm_tree, hbm_new)
+
+        # ── Step 2: DRAM read-only lookup for extra depth ───────────
+        dram_extra_tokens = 0
+        dram_extra_pages = 0
+        if hbm_hit_pages < len(pages):
+            dram_match_pages, dram_match_tokens, dram_matched = (
+                self.dram_tree.prefix_match(pages)
+            )
+            if dram_match_pages > hbm_hit_pages:
+                dram_extra_pages = dram_match_pages - hbm_hit_pages
+                dram_extra_tokens = dram_match_tokens - hbm_hit_tokens
+            # Touch DRAM matched nodes so recency info stays current.
+            if dram_matched:
+                self.dram_tree._clock += 1
+                ts = self.dram_tree._clock
+                for n in dram_matched:
+                    n.touch(ts)
+                self.dram_strategy.on_cache_hit(self.dram_tree, dram_matched)
+
+        effective_hit_tokens = hbm_hit_tokens + dram_extra_tokens
+        effective_hit_pages = hbm_hit_pages + dram_extra_pages
+
+        # ── Step 3: Evict HBM → demote to DRAM ─────────────────────
+        demoted_tokens = 0
+        demoted_nodes = 0
+        while self.hbm_tree.total_cached_tokens() > self.hbm_capacity:
+            action = self.hbm_strategy.select_eviction(self.hbm_tree)
+            if action is None:
+                break
+            victim, op = action
+            if op == "mamba":
+                self.hbm_tree.evict_mamba_state(victim)
+            else:
+                # Reconstruct full page path and demote to DRAM.
+                # This must happen BEFORE remove_leaf, while parent pointers
+                # are still valid.
+                full_pages = node_page_path(victim)
+                if full_pages:
+                    dram_new = self.dram_tree.insert_pages(
+                        full_pages,
+                        timestamp=victim.last_access,
+                        access_count=victim.access_count,
+                    )
+                    if dram_new:
+                        self.dram_strategy.on_new_nodes_inserted(
+                            self.dram_tree, dram_new
+                        )
+                # remove_leaf returns victim + pruned ancestors.
+                removed = self.hbm_tree.remove_leaf(victim)
+                for rn in removed:
+                    demoted_tokens += rn.num_tokens
+                    demoted_nodes += 1
+
+        # ── Step 4: Evict DRAM → discard ────────────────────────────
+        while self.dram_tree.total_cached_tokens() > self.dram_capacity:
+            action = self.dram_strategy.select_eviction(self.dram_tree)
+            if action is None:
+                break
+            victim, op = action
+            if op == "mamba":
+                self.dram_tree.evict_mamba_state(victim)
+            else:
+                self.dram_tree.remove_leaf(victim)
+
+        # ── Step 5: Record trace ────────────────────────────────────
+        # Promotion: DRAM extra tokens are "promoted" in the sense that
+        # they were found in DRAM and are now also in HBM (inserted by
+        # simulate_request in step 1).  We count the DRAM-exclusive
+        # contribution as promoted volume.
+        promoted_tokens = dram_extra_tokens
+        promoted_nodes = dram_extra_pages  # one node per extra matched page-group
+
+        trace = MultiTierRequestTrace(
+            input_tokens=total_tokens,
+            hit_tokens=effective_hit_tokens,
+            hit_pages=effective_hit_pages,
+            total_pages=len(pages),
+            turn_hit_tokens=turn_hit_tokens,
+            hbm_hit_tokens=hbm_hit_tokens,
+            dram_hit_tokens=dram_extra_tokens,
+            promoted_tokens=promoted_tokens,
+            promoted_nodes=promoted_nodes,
+            demoted_tokens=demoted_tokens,
+            demoted_nodes=demoted_nodes,
+            is_branch=_is_branch,
+            is_new_branch=_is_new_branch,
+        )
+        self.state.record_trace(
+            trace,
+            self.hbm_tree.total_cached_tokens(),
+            self.dram_tree.total_cached_tokens(),
+        )
+        return trace

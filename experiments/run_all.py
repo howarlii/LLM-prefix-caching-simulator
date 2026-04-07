@@ -45,7 +45,6 @@ ORDERING        = "random"
 STRATEGY        = "marconi"
 CAPACITY        = "160"          # GB, or "inf"/"unlimited"
 MODEL_NAME      = DEFAULT_MODEL.name  # see ModelConfig.list_models() for options
-MAMBA_STATE_TOKEN_EQUIV = None   # None = auto-derive from model; 0 = pure full-attention
 TOKENIZER       = DEFAULT_TOKENIZER_NAME
 SEED            = 0
 MAX_REQUESTS    = 5000
@@ -116,7 +115,6 @@ def _merge_defaults(cfg: dict) -> dict:
         "strategy":               cfg.get("strategy", STRATEGY),
         "capacity":               cfg.get("capacity", CAPACITY),
         "model_name":             cfg.get("model_name", MODEL_NAME),
-        "mamba_state_token_equiv": cfg.get("mamba_state_token_equiv", MAMBA_STATE_TOKEN_EQUIV),
         "tokenizer":              cfg.get("tokenizer", TOKENIZER),
         "seed":                   cfg.get("seed", SEED),
         "max_requests":           cfg.get("max_requests", MAX_REQUESTS),
@@ -163,7 +161,7 @@ _PREPARED: Dict[tuple, list] = {}
 
 def _sim_worker(args: Tuple) -> Dict[str, Any]:
     """Run one simulation inside a pool worker (fork inherits _PREPARED)."""
-    prep_key, page_size, strategy_name, cap, mamba, cfg = args
+    prep_key, page_size, strategy_name, cap, cfg = args
     reqs = _PREPARED[prep_key]
     model = ModelConfig.from_name(cfg["model_name"])
     strategy = strategy_from_name(strategy_name, model=model)
@@ -178,12 +176,12 @@ def _sim_worker(args: Tuple) -> Dict[str, Any]:
             page_size=page_size,
             capacity_spec=str(cfg["capacity"]),
             ordering=cfg["ordering"],
-            mamba_equiv=mamba,
+            mamba_equiv=model.mamba_state_token_equiv,
         )
         logger = TreeLogger(log_dir / fname)
 
     try:
-        metrics = run_simulation(reqs, page_size, strategy, cap, mamba, logger=logger, model=model)
+        metrics = run_simulation(reqs, page_size, strategy, cap, logger=logger, model=model)
     finally:
         if logger is not None:
             logger.close()
@@ -238,12 +236,8 @@ def main() -> None:
             model = ModelConfig.from_name(cfg["model_name"])
             page_size = effective_page_size(cfg["dataset"], int(cfg["page_size"]))
             cap = capacity_from_spec(str(cfg["capacity"]), model=model)
-            # Auto-derive mamba_state_token_equiv from model if not explicitly set.
-            mamba_raw = cfg["mamba_state_token_equiv"]
-            mamba = model.mamba_state_token_equiv if mamba_raw is None else int(mamba_raw)
-            cfg["mamba_state_token_equiv"] = mamba  # store resolved value
             strategy_name = _build_strategy_name(cfg)
-            sim_args.append((prep_key, page_size, strategy_name, cap, mamba, cfg))
+            sim_args.append((prep_key, page_size, strategy_name, cap, cfg))
 
     print(
         f"\n=== Phase 2: Running {len(sim_args)} simulation(s) "
@@ -265,6 +259,7 @@ def main() -> None:
             out_csv = RESULTS_DIR / f"results_{dataset}.csv"
             out_json_dir = RESULTS_DIR / f"json_{dataset}"
 
+            model = ModelConfig.from_name(cfg["model_name"])
             row = {
                 "dataset": dataset,
                 "page_size": effective_page_size(dataset, int(cfg["page_size"])),
@@ -272,7 +267,7 @@ def main() -> None:
                 "strategy": _build_strategy_name(cfg),
                 "capacity_spec": str(cfg["capacity"]),
                 "tokenizer": cfg["tokenizer"],
-                "mamba_state_token_equiv": int(cfg["mamba_state_token_equiv"]),
+                "mamba_state_token_equiv": model.mamba_state_token_equiv,
                 "model_name": cfg["model_name"],
                 "metrics": metrics_dict,
             }
@@ -280,11 +275,13 @@ def main() -> None:
 
             done += 1
             token_hr = metrics_dict.get("token_level_hit_rate", 0)
+            branch_r = metrics_dict.get("req_branch_rate", 0)
+            new_branch_r = metrics_dict.get("req_new_branch_rate", 0)
             flops_sr = metrics_dict.get("flops_save_rate")
             flops_str = f"  flops_save={flops_sr:.4f}" if flops_sr is not None else ""
             print(
                 f"  [{done}/{len(sim_args)}] {label}  "
-                f"token_hr={token_hr:.4f}{flops_str}",
+                f"token_hr={token_hr:.4f}  branch_rate={branch_r:.4f}  new_branch_rate={new_branch_r:.4f}{flops_str}",
                 flush=True,
             )
 
