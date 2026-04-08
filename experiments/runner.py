@@ -31,7 +31,7 @@ from src.request_generator import (
     load_or_tokenize,
     order_requests,
 )
-from src.strategies import CRFDecouplingStrategy, FIFOStrategy, LFUStrategy, LRUStrategy, MarconiStrategy, Marconi2Strategy, Marconi3Strategy, EvictionStrategy
+from src.strategies import BranchStrategy, CRFDecouplingStrategy, FIFOStrategy, LFUStrategy, LRUStrategy, MarconiStrategy, Marconi2Strategy, Marconi3Strategy, EvictionStrategy
 
 
 def effective_page_size(dataset: str, page_size: int) -> int:
@@ -49,6 +49,10 @@ def strategy_from_name(name: str, model: ModelConfig = DEFAULT_MODEL) -> Evictio
         return LFUStrategy()
     if n == "fifo":
         return FIFOStrategy()
+    if n == "branch":
+        return BranchStrategy()
+    if n == "branch_nt":
+        return BranchStrategy(newtouch=True)
     if n == "marconi" or n.startswith("marconi_"):
         # Optional alpha suffix: "marconi_a2.0" → alpha=2.0
         m = re.search(r"_a([\d.]+)", n)
@@ -68,14 +72,25 @@ def strategy_from_name(name: str, model: ModelConfig = DEFAULT_MODEL) -> Evictio
         m = re.search(r"_a([\d.]+)", n)
         kwargs = {"alpha": float(m.group(1))} if m else {}
         return Marconi2Strategy(**kwargs)
-    # Marconi3 ablation variants: marconi3_e{0|1}_mn{0|1}[_a<float>]
-    m3_ablation = re.match(r"^marconi3_ev([\d])_mn([01])", n)
+    # Marconi3 ablation variants: marconi3_ev{N}[_mn{0|1}][_nt][_a<float>]
+    # _mn defaults to 0 (mid-chain checkpoint disabled) when omitted.
+    # _nt (optional) enables the selective newtouch LRU policy.
+    m3_ablation = re.match(r"^marconi3_ev(\d)", n)
     if m3_ablation:
         evict_mode = f"ev{m3_ablation.group(1)}"
-        use_mn = m3_ablation.group(2) == "1"
-        m_alpha = re.search(r"_a([\d.]+)", n[m3_ablation.end():])
+        rest = n[m3_ablation.end():]
+        m_mn = re.search(r"_mn([01])", rest)
+        use_mn = bool(m_mn) and m_mn.group(1) == "1"
+        newtouch = "_nt" in rest
+        m_alpha = re.search(r"_a([\d.]+)", rest)
         kwargs = {"alpha": float(m_alpha.group(1))} if m_alpha else {}
-        return Marconi3Strategy(evict_mode=evict_mode, use_mid_chain_checkpoint=use_mn, model=model, **kwargs)
+        return Marconi3Strategy(
+            evict_mode=evict_mode,
+            use_mid_chain_checkpoint=use_mn,
+            newtouch=newtouch,
+            model=model,
+            **kwargs,
+        )
     if n == "marconi3" or n.startswith("marconi3_"):
         m = re.search(r"_a([\d.]+)", n)
         kwargs = {"alpha": float(m.group(1))} if m else {}

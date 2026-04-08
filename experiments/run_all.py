@@ -29,6 +29,7 @@ from experiments.runner import (
     effective_page_size,
     persist_result_row,
     prepare_requests,
+    run_multi_tier_simulation,
     run_simulation,
     strategy_from_name,
 )
@@ -61,6 +62,16 @@ MARCONI_ALPHA   = None           # default: 1.5 for marconi, 1.5 for marconi2
 CRF_LAMBDA_DECAY = None         # default: 0.5
 CRF_C_ATTN       = None         # default: 1.0
 CRF_C_SSM        = None         # default: 1.0
+
+# ── Multi-tier (HBM + DRAM) cache ───────────────────────────────────────────
+# Set MULTI_TIER=True to run two-tier simulations. When enabled, CAPACITY/STRATEGY
+# above are ignored; HBM_*/DRAM_* take over. Per-experiment overrides via
+# "multi_tier", "hbm_capacity", "dram_capacity", "hbm_strategy", "dram_strategy".
+MULTI_TIER      = False
+HBM_CAPACITY    = "20"           # GB (must be finite)
+DRAM_CAPACITY   = "160"          # GB (must be finite)
+HBM_STRATEGY    = "branch"       # eviction policy for HBM tier
+DRAM_STRATEGY   = "marconi3_ev1_mn0"  # eviction policy for DRAM tier
 
 # ── Logging (viz) ───────────────────────────────────────────────────────────
 ENABLE_LOG      = False          # True = write tree-mutation JSONL per experiment
@@ -96,9 +107,10 @@ MAX_REQUESTS    = 1000
 # capacity = "inf"
 EXPERIMENTS: list[dict] = []
 for ds in ["swesmith", "loogle", "narrativeqa", "sharegpt_90k_raw"]:
-    for page_size in [1, 32, 256]:
+    for page_size in [1, 32]:
         for capacity in [20, 80, "inf"]:
             EXPERIMENTS.append(dict(page_size=page_size, strategy="marconi3_ev1_mn0",  capacity=capacity, dataset=ds))
+            EXPERIMENTS.append(dict(page_size=page_size, strategy="branch_nt",  capacity=capacity, dataset=ds))
 
 # ╔═══════════════════════════════════════════════════════════════════════════╗
 # ║                       END OF CONFIGURATION                                ║
@@ -123,6 +135,12 @@ def _merge_defaults(cfg: dict) -> dict:
         "crf_lambda_decay":       cfg.get("crf_lambda_decay", CRF_LAMBDA_DECAY),
         "crf_c_attn":             cfg.get("crf_c_attn", CRF_C_ATTN),
         "crf_c_ssm":              cfg.get("crf_c_ssm", CRF_C_SSM),
+        # Multi-tier params
+        "multi_tier":             cfg.get("multi_tier", MULTI_TIER),
+        "hbm_capacity":           cfg.get("hbm_capacity", HBM_CAPACITY),
+        "dram_capacity":          cfg.get("dram_capacity", DRAM_CAPACITY),
+        "hbm_strategy":           cfg.get("hbm_strategy", HBM_STRATEGY),
+        "dram_strategy":          cfg.get("dram_strategy", DRAM_STRATEGY),
     }
 
 
@@ -145,6 +163,14 @@ def _build_strategy_name(cfg: dict) -> str:
 
 
 def _label(cfg: dict) -> str:
+    if cfg.get("multi_tier"):
+        return (
+            f"{cfg.get('dataset','?')} "
+            f"ps={cfg.get('page_size','?')} "
+            f"{cfg.get('ordering','?')} "
+            f"hbm:{cfg.get('hbm_strategy','?')}/{cfg.get('hbm_capacity','?')} "
+            f"dram:{cfg.get('dram_strategy','?')}/{cfg.get('dram_capacity','?')}"
+        )
     return (
         f"{cfg.get('dataset','?')} "
         f"ps={cfg.get('page_size','?')} "
@@ -160,9 +186,24 @@ _PREPARED: Dict[tuple, list] = {}
 
 def _sim_worker(args: Tuple) -> Dict[str, Any]:
     """Run one simulation inside a pool worker (fork inherits _PREPARED)."""
-    prep_key, page_size, strategy_name, cap, cfg = args
+    prep_key, page_size, sim_spec, cfg = args
     reqs = _PREPARED[prep_key]
     model = ModelConfig.from_name(cfg["model_name"])
+
+    if cfg.get("multi_tier"):
+        hbm_strat = strategy_from_name(sim_spec["hbm_strategy"], model=model)
+        dram_strat = strategy_from_name(sim_spec["dram_strategy"], model=model)
+        # NOTE: TreeLogger is not currently wired through run_multi_tier_simulation.
+        metrics = run_multi_tier_simulation(
+            reqs, page_size, hbm_strat, dram_strat,
+            hbm_capacity_tokens=sim_spec["hbm_cap"],
+            dram_capacity_tokens=sim_spec["dram_cap"],
+            model=model,
+        )
+        return {"cfg": cfg, "metrics": metrics.to_dict()}
+
+    strategy_name = sim_spec["strategy_name"]
+    cap = sim_spec["cap"]
     strategy = strategy_from_name(strategy_name, model=model)
 
     logger = None
@@ -234,9 +275,27 @@ def main() -> None:
         for cfg in cfgs:
             model = ModelConfig.from_name(cfg["model_name"])
             page_size = effective_page_size(cfg["dataset"], int(cfg["page_size"]))
-            cap = capacity_from_spec(str(cfg["capacity"]), model=model)
-            strategy_name = _build_strategy_name(cfg)
-            sim_args.append((prep_key, page_size, strategy_name, cap, cfg))
+            if cfg.get("multi_tier"):
+                hbm_cap = capacity_from_spec(str(cfg["hbm_capacity"]), model=model)
+                dram_cap = capacity_from_spec(str(cfg["dram_capacity"]), model=model)
+                if hbm_cap is None or dram_cap is None:
+                    raise SystemExit(
+                        f"multi_tier requires finite hbm_capacity/dram_capacity (got "
+                        f"hbm={cfg['hbm_capacity']!r}, dram={cfg['dram_capacity']!r})"
+                    )
+                sim_spec = {
+                    "hbm_strategy": cfg["hbm_strategy"],
+                    "dram_strategy": cfg["dram_strategy"],
+                    "hbm_cap": hbm_cap,
+                    "dram_cap": dram_cap,
+                }
+            else:
+                cap = capacity_from_spec(str(cfg["capacity"]), model=model)
+                sim_spec = {
+                    "strategy_name": _build_strategy_name(cfg),
+                    "cap": cap,
+                }
+            sim_args.append((prep_key, page_size, sim_spec, cfg))
 
     print(
         f"\n=== Phase 2: Running {len(sim_args)} simulation(s) "
@@ -259,12 +318,18 @@ def main() -> None:
             out_json_dir = RESULTS_DIR / f"json_{dataset}"
 
             model = ModelConfig.from_name(cfg["model_name"])
+            if cfg.get("multi_tier"):
+                strategy_label = f"hbm:{cfg['hbm_strategy']}_dram:{cfg['dram_strategy']}"
+                capacity_label = f"hbm{cfg['hbm_capacity']}_dram{cfg['dram_capacity']}"
+            else:
+                strategy_label = _build_strategy_name(cfg)
+                capacity_label = str(cfg["capacity"])
             row = {
                 "dataset": dataset,
                 "page_size": effective_page_size(dataset, int(cfg["page_size"])),
                 "ordering": cfg["ordering"],
-                "strategy": _build_strategy_name(cfg),
-                "capacity_spec": str(cfg["capacity"]),
+                "strategy": strategy_label,
+                "capacity_spec": capacity_label,
                 "tokenizer": cfg["tokenizer"],
                 "mamba_state_token_equiv": model.mamba_state_token_equiv,
                 "model_name": cfg["model_name"],
@@ -278,9 +343,15 @@ def main() -> None:
             new_branch_r = metrics_dict.get("req_new_branch_rate", 0)
             flops_sr = metrics_dict.get("flops_save_rate")
             flops_str = f"  flops_save={flops_sr:.4f}" if flops_sr is not None else ""
+            if cfg.get("multi_tier"):
+                hbm_hr = metrics_dict.get("hbm_token_hit_rate", 0)
+                dram_hr = metrics_dict.get("dram_token_hit_rate", 0)
+                tier_str = f"  hbm_hr={hbm_hr:.4f}  dram_hr={dram_hr:.4f}"
+            else:
+                tier_str = ""
             print(
                 f"  [{done}/{len(sim_args)}] {label}  "
-                f"token_hr={token_hr:.4f}  branch_rate={branch_r:.4f}  new_branch_rate={new_branch_r:.4f}{flops_str}",
+                f"token_hr={token_hr:.4f}{tier_str}  branch_rate={branch_r:.4f}  new_branch_rate={new_branch_r:.4f}{flops_str}",
                 flush=True,
             )
 

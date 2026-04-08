@@ -1,6 +1,7 @@
 """Eviction strategies for the KV cache simulator."""
 
 from src.strategies.base import EvictionStrategy
+from src.strategies.branch import BranchStrategy
 from src.strategies.crf_decoupling import CRFDecouplingStrategy
 from src.strategies.fifo import FIFOStrategy
 from src.strategies.lfu import LFUStrategy
@@ -11,6 +12,7 @@ from src.strategies.marconi3 import Marconi3Strategy
 
 __all__ = [
     "EvictionStrategy",
+    "BranchStrategy",
     "CRFDecouplingStrategy",
     "LRUStrategy",
     "LFUStrategy",

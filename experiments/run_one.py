@@ -55,9 +55,9 @@ def main() -> None:
                    help="HBM capacity in GB (required with --multi-tier)")
     p.add_argument("--dram-capacity", default=None,
                    help="DRAM capacity in GB (required with --multi-tier)")
-    p.add_argument("--hbm-strategy", default=None,
+    p.add_argument("--hbm-strategy", default="branch",
                    help="HBM eviction strategy (defaults to --strategy)")
-    p.add_argument("--dram-strategy", default=None,
+    p.add_argument("--dram-strategy", default="marconi3_ev1_mn0",
                    help="DRAM eviction strategy (defaults to --strategy)")
 
     p.add_argument("--out-csv", type=Path, default=None,

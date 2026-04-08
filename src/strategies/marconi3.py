@@ -47,6 +47,16 @@ from src.strategies.marconi import _normalize
 _MIN_CHAIN_TOKENS_FOR_MID_CHECKPOINT = 2048
 
 
+def _effective_ts(node: RadixNode) -> int:
+    """Recency sort key: prefer the strategy-managed timestamp, fall back to last_access.
+
+    When ``newtouch`` is disabled, ``_m3_lru`` is never written and this
+    collapses to ``node.last_access`` — identical to the pre-newtouch
+    scoring behaviour.
+    """
+    return getattr(node, "_m3_lru", node.last_access)
+
+
 def _estimate_leaf_free(leaf: RadixNode) -> int:
     """Estimate tokens freed by removing a leaf and pruning its empty chain."""
     total = leaf.num_tokens
@@ -72,8 +82,30 @@ class Marconi3Strategy(EvictionStrategy):
         Scoring formula: ``"ev0"`` for original Marconi, ``"ev1"`` for
         marconi2-style normalisation with FLOP formulas.
     use_mid_chain_checkpoint:
-        If True (default), place a mid-chain mamba state at ~55% of long
-        new chains.  Setting False disables this behaviour.
+        If True, place a mid-chain mamba state at ~55% of long new chains.
+        Defaults to False (mid-chain checkpointing disabled).
+    newtouch:
+        If False (default), recency is taken directly from
+        ``node.last_access`` — the radix tree refreshes every matched
+        node on a hit, matching standard LRU-style behaviour.
+
+        If True, the strategy overrides the touch policy via a parallel
+        ``_m3_lru`` attribute maintained on each node:
+
+        * The deepest matched node (last hit) is always refreshed.
+        * For each ancestor matched node ``n``, look at the "previous
+          checkpoint" — the deepest mamba-state node already passed
+          while walking upward from the deepest hit toward ``n``:
+
+          - leaf checkpoint (no children)  → do not refresh ``n``;
+          - branch-point checkpoint (≥2 children) → refresh ``n``;
+          - otherwise (no checkpoint, or single-child checkpoint)
+            → do not refresh ``n``.
+
+        The eviction scoring formulas are unchanged — they simply read
+        ``_effective_ts(n)`` instead of ``n.last_access`` for recency,
+        and fall back to ``last_access`` when ``_m3_lru`` is not set
+        (e.g. split-induced suffixes).
     model:
         Model architecture configuration.  Provides layer counts, hidden
         dimension, and SSM state dimension for FLOP computation.
@@ -83,12 +115,14 @@ class Marconi3Strategy(EvictionStrategy):
         self,
         alpha: float = 1.5,
         evict_mode: str = "ev0",
-        use_mid_chain_checkpoint: bool = True,
+        use_mid_chain_checkpoint: bool = False,
+        newtouch: bool = False,
         model: ModelConfig = DEFAULT_MODEL,
     ) -> None:
         self.alpha = alpha
         self.evict_mode = evict_mode
         self.use_mid_chain_checkpoint = use_mid_chain_checkpoint
+        self.newtouch = newtouch
         self.model = model
         self.num_ssm_layers = model.num_ssm_layers
         self.num_attn_layers = model.num_attn_layers
@@ -108,12 +142,50 @@ class Marconi3Strategy(EvictionStrategy):
         """Admit Mamba state only at turn-end nodes (last token of a request)."""
         return node.is_turn_end
 
+    def on_cache_hit(
+        self, tree: RadixTree, matched_nodes: List[RadixNode]
+    ) -> None:
+        """Selective touch policy when ``newtouch`` is enabled.
+
+        Does nothing when ``newtouch`` is False — the radix tree's
+        built-in ``last_access`` refresh is sufficient, and
+        ``_effective_ts`` falls back to it.
+        """
+        if not self.newtouch or not matched_nodes:
+            return
+        ts = tree.clock
+
+        # Deepest matched node is always refreshed.
+        last = matched_nodes[-1]
+        last._m3_lru = ts  # type: ignore[attr-defined]
+
+        # Walk from the deepest matched upward.  ``cur_cp`` is the
+        # deepest mamba-state node already visited in this walk —
+        # i.e. the "previous checkpoint" for the next ancestor we
+        # look at.
+        cur_cp: Optional[RadixNode] = last if last.has_mamba_state else None
+        for i in range(len(matched_nodes) - 2, -1, -1):
+            n = matched_nodes[i]
+            if cur_cp is not None:
+                num_ch = len(cur_cp.children)
+                if num_ch > 1:
+                    # previous checkpoint is a branch point → refresh n
+                    n._m3_lru = ts  # type: ignore[attr-defined]
+                # num_ch == 0 (leaf) or num_ch == 1 (single-child): skip.
+            if n.has_mamba_state:
+                cur_cp = n
+
     def on_new_nodes_inserted(
         self, tree: RadixTree, new_nodes: List[RadixNode]
     ) -> None:
         """Handle fork-point parent admission + mid-chain checkpoint placement."""
         if not new_nodes:
             return
+
+        if self.newtouch:
+            ts = tree.clock
+            for n in new_nodes:
+                n._m3_lru = ts  # type: ignore[attr-defined]
 
         # --- Fork-point parent ---
         parent = new_nodes[0].parent
@@ -281,15 +353,19 @@ class Marconi3Strategy(EvictionStrategy):
         flop_eff = flops_savings / memory_occupy per node.
         """
         recency_values = [
-            1.0 / max(current_ts - n.last_access, 1)
+            1.0 / max(current_ts - _effective_ts(n), 1)
             for n, _, _, _ in candidates
         ]
 
         flop_eff_values = []
-        for n, _, dt, cp in candidates:
+        for n, op, dt, cp in candidates:
             flops = self._node_flops_savings(dt, cp)
-            mem = self._node_memory_occupy(dt, cp, n.has_mamba_state)
-            assert flops >= 0 and mem >= 0, f"Negative flops ({flops}) or memory ({mem}) for node {n}"
+            if op == "leaf":
+                mem = self._node_memory_occupy(dt, cp, n.has_mamba_state)
+            elif op == "mamba" and len(n.children) == 1:
+                mem = self._mamba_memory_occupy()
+            else:
+                mem = 0
             flop_eff_values.append(flops / mem if mem > 0 else 0.0)
 
         norm_recency = _normalize(recency_values)
@@ -297,9 +373,8 @@ class Marconi3Strategy(EvictionStrategy):
 
         scored: List[Tuple[float, RadixNode, EvictOp]] = []
         for (n, op, _, _), rec, eff in zip(candidates, norm_recency, norm_flop_eff):
-            if op == "leaf":
-                score = self.alpha * eff + rec
-                scored.append((score, n, op))
+            score = self.alpha * eff + rec
+            scored.append((score, n, op))
 
         scored.sort(key=lambda x: x[0])
         return scored
@@ -315,7 +390,7 @@ class Marconi3Strategy(EvictionStrategy):
         score = norm_r + alpha * norm_d
         """
         recency_values = [
-            1.0 / max(current_ts - n.last_access, 1)
+            1.0 / max(current_ts - _effective_ts(n), 1)
             for n, _, _, _ in candidates
         ]
 
@@ -350,7 +425,7 @@ class Marconi3Strategy(EvictionStrategy):
         raw_score = norm_r + alpha * norm_flops
         score = raw_score / memory_occupy
         """
-        recencies = [n.last_access for n, _, _, _ in candidates]
+        recencies = [_effective_ts(n) for n, _, _, _ in candidates]
 
         flops_values = [
             self._node_flops_savings(dt, cp)
@@ -387,7 +462,7 @@ class Marconi3Strategy(EvictionStrategy):
         raw_score = norm_r + alpha * norm_flops
         score = raw_score / memory_occupy
         """
-        recencies = [n.last_access for n, _, _, _ in candidates]
+        recencies = [_effective_ts(n) for n, _, _, _ in candidates]
 
         flops_values = [
             self._node_flops_savings(dt, cp)
