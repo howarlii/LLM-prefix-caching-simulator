@@ -20,8 +20,13 @@ from __future__ import annotations
 from collections import deque
 from typing import List, Optional, Tuple
 
-from src.radix_tree import RadixNode, RadixTree
-from src.strategies.base import EvictOp, EvictionStrategy
+from src.radix_tree import PageKey, RadixNode, RadixTree
+from src.strategies.base import (
+    EvictOp,
+    EvictionStrategy,
+    PageStatus,
+    RequestPlan,
+)
 
 # Minimum chain token length to place a mid-chain checkpoint.
 _MIN_CHAIN_TOKENS_FOR_MID_CHECKPOINT = 2048
@@ -67,10 +72,6 @@ class Marconi2Strategy(EvictionStrategy):
         self.use_checkpoint_relative_evict = use_checkpoint_relative_evict
         self.use_mid_chain_checkpoint = use_mid_chain_checkpoint
 
-    @property
-    def drop_partial_last_page(self) -> bool:
-        return True
-
     # ------------------------------------------------------------------
     # Unified scoring
     # ------------------------------------------------------------------
@@ -88,26 +89,24 @@ class Marconi2Strategy(EvictionStrategy):
         mte = tree.mamba_state_token_equiv
         use_cp = self.use_checkpoint_relative_evict
 
-        # Top-down BFS: precompute depth_tokens and checkpoint-relative depth.
+        # Top-down BFS: depth_tokens is precomputed on each node; only
+        # checkpoint-relative depth needs tracking.
         # node_depths maps node id -> (depth_tokens, depth_from_checkpoint)
         node_depths: dict[int, Tuple[int, int]] = {}
-        q: deque[Tuple[RadixNode, int, int]] = deque()
+        q: deque[Tuple[RadixNode, int]] = deque()
         for child in tree.root.children.values():
-            # tokens_from_checkpoint starts fresh from root
-            q.append((child, child.num_tokens, child.num_tokens))
+            q.append((child, child.num_tokens))
 
         while q:
-            node, depth_tokens, depth_from_cp = q.popleft()
-            node_depths[id(node)] = (depth_tokens, depth_from_cp)
+            node, depth_from_cp = q.popleft()
+            node_depths[id(node)] = (node.depth_tokens, depth_from_cp)
 
-            # For children: if this node has mamba state, reset checkpoint distance
             for ch in node.children.values():
-                ch_depth = depth_tokens + ch.num_tokens
                 if node.has_mamba_state:
                     ch_from_cp = ch.num_tokens
                 else:
                     ch_from_cp = depth_from_cp + ch.num_tokens
-                q.append((ch, ch_depth, ch_from_cp))
+                q.append((ch, ch_from_cp))
 
         leaf_candidates: List[RadixNode] = list(tree.leaf_node_set())
         mamba_candidates: List[RadixNode] = [
@@ -152,101 +151,75 @@ class Marconi2Strategy(EvictionStrategy):
     # Admission
     # ------------------------------------------------------------------
 
-    def admit_mamba_state(self, node: RadixNode) -> bool:
-        """Admit Mamba state only at turn-end nodes."""
-        return node.is_turn_end
+    def plan_request(
+        self,
+        tree: RadixTree,
+        matched_nodes: List[RadixNode],
+        remaining_pages: List[PageKey],
+    ) -> RequestPlan:
+        """Admit every remaining page; place mamba at turn-end,
+        fork-point parent, and (optionally) at the mid-chain ~55% point
+        of long new chains."""
+        if not remaining_pages:
+            return RequestPlan(remaining=[])
 
-    def on_new_nodes_inserted(
-        self, tree: RadixTree, new_nodes: List[RadixNode]
-    ) -> None:
-        """Handle fork-point parent admission + mid-chain checkpoint placement.
+        statuses: List[PageStatus] = [PageStatus.KV_ONLY] * len(remaining_pages)
+        fork_point = False
 
-        With compressed multi-page nodes, new_nodes is typically a single node.
-        If a mid-chain checkpoint is needed inside that node, we split it.
-        """
-        if not new_nodes:
-            return
+        if tree.mamba_state_token_equiv == 0:
+            return RequestPlan(remaining=statuses)
+
+        parent = matched_nodes[-1] if matched_nodes else tree.root
+        parent_depth = parent.depth_tokens
+
+        # --- Turn-end mamba ---
+        statuses[-1] = PageStatus.KV_AND_MAMBA
+        end_depth = parent_depth + sum(len(p) for p in remaining_pages)
 
         # --- Fork-point parent ---
-        parent = new_nodes[0].parent
-        if parent is not None and parent is not tree.root:
-            if len(parent.children) > 1 and not parent.has_mamba_state:
-                tree.set_mamba_state(parent)
+        if (
+            parent is not tree.root
+            and len(parent.children) >= 1
+            and not parent.has_mamba_state
+        ):
+            fork_point = True
 
-        # --- Mid-chain checkpoint at ~55% ---
+        # --- Mid-chain checkpoint at ~55% of (last_checkpoint → end) ---
         if not self.use_mid_chain_checkpoint:
-            return
+            return RequestPlan(
+                remaining=statuses, mamba_on_matched_parent=fork_point
+            )
 
-        # Compute token gap from last checkpoint/root to the start of new nodes.
-        anchor = new_nodes[0].parent
-        tokens_before_chain = 0
-        cur = anchor
-        while cur is not None and cur.parent is not None:
-            if cur.has_mamba_state:
+        # Walk up matched_nodes to find the last mamba checkpoint.
+        last_checkpoint_depth = 0
+        for n in reversed(matched_nodes):
+            if n.has_mamba_state:
+                last_checkpoint_depth = n.depth_tokens
                 break
-            tokens_before_chain += cur.num_tokens
-            cur = cur.parent
 
-        chain_tokens = sum(n.num_tokens for n in new_nodes)
-        total_span = tokens_before_chain + chain_tokens
-
+        total_span = end_depth - last_checkpoint_depth
         if total_span < _MIN_CHAIN_TOKENS_FOR_MID_CHECKPOINT:
-            return
+            return RequestPlan(
+                remaining=statuses, mamba_on_matched_parent=fork_point
+            )
 
-        target_pos = int(total_span * 0.55)
+        target_depth = last_checkpoint_depth + int(total_span * 0.55)
+        # Convert target_depth → page index within remaining_pages.
+        if target_depth > parent_depth and target_depth < end_depth:
+            offset = target_depth - parent_depth
+            cum = 0
+            for i, p in enumerate(remaining_pages):
+                cum += len(p)
+                if cum >= offset:
+                    # Place mamba at the end of page i (snapped to the
+                    # smallest page boundary at-or-past target).
+                    if statuses[i] != PageStatus.KV_AND_MAMBA:
+                        statuses[i] = PageStatus.KV_AND_MAMBA
+                    break
 
-        if target_pos <= tokens_before_chain:
-            # Target falls in ancestor chain above new nodes.
-            remaining = tokens_before_chain - target_pos
-            candidate = anchor
-            while candidate is not None and candidate.parent is not None:
-                if candidate.has_mamba_state:
-                    break
-                if remaining <= 0:
-                    break
-                remaining -= candidate.num_tokens
-                if remaining <= 0:
-                    break
-                candidate = candidate.parent
-            if candidate is not None and candidate is not tree.root and not candidate.has_mamba_state:
-                # If target falls inside a multi-page node, split it.
-                if candidate.num_pages > 1:
-                    # Approximate: place checkpoint at a page boundary near the target.
-                    offset_in_node = candidate.num_tokens + remaining  # remaining is <= 0
-                    pages_to_keep = 0
-                    cum = 0
-                    for p in candidate.pages:
-                        cum += len(p)
-                        pages_to_keep += 1
-                        if cum >= offset_in_node:
-                            break
-                    if 0 < pages_to_keep < candidate.num_pages:
-                        tree.split_node(candidate, pages_to_keep)
-                        # After split, candidate IS the prefix — set mamba on it.
-                tree.set_mamba_state(candidate)
-        else:
-            # Target falls within the new nodes.
-            offset_in_chain = target_pos - tokens_before_chain
-            cumulative = 0
-            for node in new_nodes:
-                if cumulative + node.num_tokens >= offset_in_chain:
-                    # Target is inside this node.  Find the page boundary.
-                    offset_in_node = offset_in_chain - cumulative
-                    if offset_in_node > 0 and node.num_pages > 1:
-                        pages_to_keep = 0
-                        cum = 0
-                        for p in node.pages:
-                            cum += len(p)
-                            pages_to_keep += 1
-                            if cum >= offset_in_node:
-                                break
-                        if 0 < pages_to_keep < node.num_pages:
-                            tree.split_node(node, pages_to_keep)
-                            # After split, node IS the prefix.
-                    if not node.has_mamba_state:
-                        tree.set_mamba_state(node)
-                    break
-                cumulative += node.num_tokens
+        return RequestPlan(
+            remaining=statuses, mamba_on_matched_parent=fork_point
+        )
 
     # ------------------------------------------------------------------
     # Eviction — unified via select_eviction

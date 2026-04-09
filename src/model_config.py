@@ -1,15 +1,23 @@
-"""Unified model configuration for KV cache, Mamba state, and FLOPs calculations.
+"""Unified model configuration for KV cache, Mamba state, and FLOP calculations.
 
 Instead of hardcoding model architecture parameters across strategies and config,
-a single ``ModelConfig`` captures everything the simulator needs.  Pre-defined
-configurations are available via ``ModelConfig.from_name()``.
+a single ``ModelConfig`` captures everything *model-specific* the simulator
+needs.  Hardware-specific quantities (GPU compute throughput, PCIe bandwidth)
+are passed separately at simulation/metric time — they are not stored on
+``ModelConfig``.  Pre-defined configurations are available via
+``ModelConfig.from_name()``.
+
+Naming convention: ``flop`` denotes a *count* of floating-point operations
+(extensive quantity, e.g. ``prefill_flop``); ``flops`` denotes operations
+*per second* (rate / throughput, e.g. the ``gpu_flops`` argument passed to
+``compute_run_metrics``).
 
 Usage::
 
     model = ModelConfig.from_name("qwen3.5-27b")
     print(model.kv_bytes_per_token)       # bytes of KV cache per token
-    print(model.prefill_flops(2048))      # total prefill FLOPs for 2048 tokens
-    print(model.mamba_state_token_equiv)   # recurrent state cost in token-equivalent units
+    print(model.prefill_flop(2048))       # total prefill FLOP for 2048 tokens
+    print(model.mamba_state_token_equiv)  # recurrent state cost in token-equivalent units
 """
 
 from __future__ import annotations
@@ -19,23 +27,24 @@ from typing import Dict
 
 
 # ---------------------------------------------------------------------------
-# Low-level FLOPs / memory helpers (per-layer, used by eviction strategies
-# for *relative* scoring — these assume MHA and standard 4×D FFN for
-# simplicity; ModelConfig methods use the precise per-model formulas).
+# Low-level FLOP-count / memory helpers (per-layer, used by eviction
+# strategies for *relative* scoring — these assume MHA and standard 4×D
+# FFN for simplicity; ModelConfig methods use the precise per-model
+# formulas).  All helpers return *counts*, not rates.
 # ---------------------------------------------------------------------------
 
-def _attn_flops(l: int, d: int) -> float:
-    """Attention block FLOPs (MHA approximation): 8*L*D^2 + 4*L^2*D."""
+def _attn_flop(l: int, d: int) -> float:
+    """Attention block FLOP count (MHA approximation): 8*L*D^2 + 4*L^2*D."""
     return 8 * l * d ** 2 + 4 * l ** 2 * d
 
 
-def _mlp_flops(l: int, d: int) -> float:
-    """MLP block FLOPs (non-gated, I=4D approximation): 16*L*D^2."""
+def _mlp_flop(l: int, d: int) -> float:
+    """MLP block FLOP count (non-gated, I=4D approximation): 16*L*D^2."""
     return 16 * l * d ** 2
 
 
-def _mamba1_flops(l: int, d: int, n: int) -> float:
-    """Mamba-1 layer FLOPs: 12*L*D^2 + 16*L*D*N + 10*L*D."""
+def _mamba1_flop(l: int, d: int, n: int) -> float:
+    """Mamba-1 layer FLOP count: 12*L*D^2 + 16*L*D*N + 10*L*D."""
     return 12 * l * d ** 2 + 16 * l * d * n + 10 * l * d
 
 
@@ -160,10 +169,10 @@ class ModelConfig:
             return 0
         return max(1, int(self.mamba_state_bytes_total / bpt))
 
-    # -- FLOPs -----------------------------------------------------------
+    # -- FLOP counts -----------------------------------------------------
 
-    def _attn_flops_layer(self, seqlen: int) -> float:
-        """One attention layer prefill FLOPs (GQA-aware).
+    def _attn_flop_layer(self, seqlen: int) -> float:
+        """One attention layer prefill FLOP count (GQA-aware).
 
         Q/O projections: d_model → d_model (2 * 2 * L * D²).
         K/V projections: d_model → kv_channels (2 * 2 * L * D * kv).
@@ -173,8 +182,8 @@ class ModelConfig:
         kv = self.effective_kv_channels
         return (4 * d + 4 * kv) * seqlen * d + 4 * seqlen ** 2 * d
 
-    def _mlp_flops_layer(self, seqlen: int) -> float:
-        """One MLP layer prefill FLOPs.
+    def _mlp_flop_layer(self, seqlen: int) -> float:
+        """One MLP layer prefill FLOP count.
 
         Non-gated (up + down): 2 * 2 * L * D * I = 4 * L * D * I.
         Gated (gate + up + down): 3 * 2 * L * D * I = 6 * L * D * I.
@@ -184,31 +193,31 @@ class ModelConfig:
         factor = 6 if self.mlp_gated else 4
         return factor * seqlen * d * i
 
-    def _ssm_flops_layer(self, seqlen: int) -> float:
-        """One SSM / linear-attention layer prefill FLOPs."""
+    def _ssm_flop_layer(self, seqlen: int) -> float:
+        """One SSM / linear-attention layer prefill FLOP count."""
         if self.num_ssm_layers == 0:
             return 0.0
-        return _mamba1_flops(seqlen, self.d_model, self.ssm_state_dim)
+        return _mamba1_flop(seqlen, self.d_model, self.ssm_state_dim)
 
-    def prefill_flops(self, seqlen: int) -> float:
-        """Total FLOPs for a full prefill of *seqlen* tokens (no cache)."""
+    def prefill_flop(self, seqlen: int) -> float:
+        """Total FLOP count for a full prefill of *seqlen* tokens (no cache)."""
         total = float(
-            self.num_attn_layers * self._attn_flops_layer(seqlen)
-            + self.num_mlp_layers * self._mlp_flops_layer(seqlen)
+            self.num_attn_layers * self._attn_flop_layer(seqlen)
+            + self.num_mlp_layers * self._mlp_flop_layer(seqlen)
         )
         if self.num_ssm_layers > 0 and self.ssm_state_dim > 0:
-            total += self.num_ssm_layers * self._ssm_flops_layer(seqlen)
+            total += self.num_ssm_layers * self._ssm_flop_layer(seqlen)
         return total
 
-    def incremental_prefill_flops(self, total_len: int, cached_prefix_len: int) -> float:
-        """FLOPs to compute suffix tokens given a cached prefix.
+    def incremental_prefill_flop(self, total_len: int, cached_prefix_len: int) -> float:
+        """FLOP count to compute suffix tokens given a cached prefix.
 
         For attention layers the suffix tokens still attend to the full
         sequence (including cached prefix keys), so the cost is not simply
-        ``prefill_flops(suffix_len)``.
+        ``prefill_flop(suffix_len)``.
         """
         if cached_prefix_len <= 0:
-            return self.prefill_flops(total_len)
+            return self.prefill_flop(total_len)
         if cached_prefix_len >= total_len:
             return 0.0
 
@@ -221,11 +230,11 @@ class ModelConfig:
             (4 * d + 4 * kv) * suffix * d + 4 * suffix * total_len * d
         )
         # MLP: only suffix tokens
-        mlp = self.num_mlp_layers * self._mlp_flops_layer(suffix)
+        mlp = self.num_mlp_layers * self._mlp_flop_layer(suffix)
         # SSM: only suffix tokens (state loaded from checkpoint)
         ssm = 0.0
         if self.num_ssm_layers > 0 and self.ssm_state_dim > 0:
-            ssm = self.num_ssm_layers * _mamba1_flops(suffix, d, self.ssm_state_dim)
+            ssm = self.num_ssm_layers * _mamba1_flop(suffix, d, self.ssm_state_dim)
 
         return attn + mlp + ssm
 

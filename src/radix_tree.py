@@ -10,38 +10,26 @@ one node per page.
 
 Hybrid-model extension
 ----------------------
-When ``mamba_state_token_equiv > 0`` the tree operates in hybrid mode (e.g.
+When the tree is constructed with a hybrid ``ModelConfig`` (i.e. one whose
+``mamba_state_token_equiv > 0``), the tree operates in hybrid mode (e.g.
 Mamba + full-attention).  Each node may optionally store a Mamba SSM state
 (``has_mamba_state``).  In hybrid mode a cache *hit* at depth D requires the
 node at depth D to carry a Mamba state; pages matched beyond the last such
 node are counted as *KV-only hits* (KV cache present but no compute savings).
-When ``mamba_state_token_equiv == 0`` (default) the tree behaves identically
-to the original pure full-attention simulation.
+For pure-transformer models (or when no model is provided) the tree behaves
+identically to the original full-attention simulation.
 """
 
 from __future__ import annotations
 
 from collections import deque
 from dataclasses import dataclass, field
-from typing import Dict, Iterator, List, Optional, Set, Tuple
+from typing import TYPE_CHECKING, Dict, Iterator, List, Optional, Set, Tuple
+
+if TYPE_CHECKING:
+    from src.model_config import ModelConfig
 
 PageKey = Tuple[int, ...]
-
-
-def node_page_path(node: "RadixNode") -> List[PageKey]:
-    """Reconstruct the full page sequence from root to *node* (inclusive).
-
-    Walks parent pointers from *node* up to the root, collects each node's
-    ``pages`` tuple, reverses, and flattens into a single page list.
-    The root node (empty pages) is excluded.
-    """
-    segments: List[Tuple[PageKey, ...]] = []
-    cur = node
-    while cur is not None and cur.pages:
-        segments.append(cur.pages)
-        cur = cur.parent
-    segments.reverse()
-    return [p for seg in segments for p in seg]
 
 
 @dataclass
@@ -59,6 +47,9 @@ class RadixNode:
     is_turn_end: bool = False
     # True if a Mamba SSM state is stored at this node (hybrid-model mode).
     has_mamba_state: bool = False
+    # Total tokens from root down to (and including) this node.  Set at
+    # insertion / split time.  The root has depth_tokens == 0.
+    depth_tokens: int = 0
 
     # Identity-based hash so nodes can live in sets.
     __hash__ = object.__hash__
@@ -80,18 +71,22 @@ class RadixTree:
 
     Parameters
     ----------
-    mamba_state_token_equiv:
-        How many full-attention token-equivalent units one Mamba SSM state
-        counts toward cache capacity.  ``0`` (default) = pure full-attention
-        mode, no Mamba state overhead and no hit gating.
+    model:
+        Optional :class:`~src.model_config.ModelConfig`.  When supplied,
+        ``mamba_state_token_equiv`` is derived from it; pure-transformer
+        models (or ``None``) collapse to full-attention behaviour with
+        no recurrent-state overhead and no hit gating.
     """
 
-    def __init__(self, mamba_state_token_equiv: int = 0) -> None:
+    def __init__(self, model: Optional["ModelConfig"] = None) -> None:
         self._root = RadixNode(pages=())
         self._node_counter = 0
         self._clock = 0  # monotonic logical timestamp (incremented per request)
         self._token_count = 0
-        self._mamba_state_token_equiv = mamba_state_token_equiv
+        self._model = model
+        self._mamba_state_token_equiv = (
+            model.mamba_state_token_equiv if model is not None else 0
+        )
         self._mamba_state_count = 0  # nodes currently carrying a Mamba state
         # Incremental indexes — avoid full-tree BFS on every eviction call.
         self._leaf_set: Set[RadixNode] = set()
@@ -110,7 +105,13 @@ class RadixTree:
         return self._clock
 
     @property
+    def model(self) -> Optional["ModelConfig"]:
+        """Model configuration used by this tree (``None`` for pure-transformer / unspecified)."""
+        return self._model
+
+    @property
     def mamba_state_token_equiv(self) -> int:
+        """Token-equivalent cost of one Mamba SSM state (``0`` outside hybrid mode)."""
         return self._mamba_state_token_equiv
 
     def _next_creation_order(self) -> int:
@@ -187,6 +188,7 @@ class RadixTree:
             creation_order=node.creation_order,
             is_turn_end=node.is_turn_end,
             has_mamba_state=node.has_mamba_state,
+            depth_tokens=node.depth_tokens,  # suffix keeps the original total depth
         )
 
         # Update grandchildren's parent pointers.
@@ -196,6 +198,7 @@ class RadixTree:
         # Mutate node to become the prefix.
         node.pages = prefix_pages
         node.num_tokens = prefix_tokens
+        node.depth_tokens = node.depth_tokens - suffix_tokens  # prefix is shallower
         node.children = {suffix_pages[0]: suffix}
         node.creation_order = self._next_creation_order()
         node.is_turn_end = False
@@ -235,23 +238,24 @@ class RadixTree:
     # Request simulation
     # ------------------------------------------------------------------
 
-    def simulate_request(
+    def match_and_split(
         self, pages: List[PageKey]
-    ) -> Tuple[int, int, int, int, List[RadixNode], List[RadixNode], bool, bool]:
-        """Match longest page prefix, touch hit nodes, insert missing suffix.
+    ) -> Tuple[List[RadixNode], int]:
+        """Walk the longest page prefix, splitting on partial node matches.
+
+        Advances the logical clock and touches every fully-matched node
+        (updates ``last_access`` and ``access_count``).  Splits the divergence
+        node when only a prefix of its pages matches, so the returned
+        ``matched_nodes`` always end on an exact page boundary.
+
+        Does NOT insert any missing suffix — that is the simulator's job
+        (driven by strategy-supplied ops via :meth:`insert_leaf_at`).
 
         Returns
         -------
-        hit_pages : int
-        hit_tokens : int
-        total_input_tokens : int
-        turn_hit_tokens : int
-        new_nodes : List[RadixNode]
         matched_nodes : List[RadixNode]
-        is_branch : bool
-            True if new nodes were inserted at a non-leaf (branching) point.
-        is_new_branch : bool
-            True if *is_branch* and the branch-point node has no Mamba state.
+        page_idx : int
+            Number of pages consumed by the match.
         """
         self._clock += 1
         ts = self._clock
@@ -265,7 +269,6 @@ class RadixTree:
             if ch is None:
                 break
 
-            # Compare ch.pages against incoming pages.
             ch_pages = ch.pages
             match_len = 0
             for i in range(len(ch_pages)):
@@ -276,7 +279,6 @@ class RadixTree:
                 match_len = len(ch_pages)
 
             if match_len == len(ch_pages):
-                # Full match of this node.
                 ch.touch(ts)
                 matched_nodes.append(ch)
                 node = ch
@@ -284,74 +286,121 @@ class RadixTree:
             else:
                 # Partial match — split at the divergence point.
                 self.split_node(ch, match_len)
-                # After split, ch IS the prefix (mutated in place).
                 ch.touch(ts)
                 matched_nodes.append(ch)
-                node = ch
                 page_idx += match_len
                 break
 
-        # Build cumulative page/token counts for matched nodes.
-        cum_pages: List[int] = []
-        cum_tokens: List[int] = []
-        cp, ct = 0, 0
-        for n in matched_nodes:
-            cp += n.num_pages
-            ct += n.num_tokens
-            cum_pages.append(cp)
-            cum_tokens.append(ct)
+        return matched_nodes, page_idx
 
-        total_matched_pages = cp
-        total_matched_tokens = ct
+    def insert_leaf_at(
+        self,
+        parent: RadixNode,
+        pages: Tuple[PageKey, ...],
+        *,
+        timestamp: Optional[int] = None,
+        access_count: int = 1,
+    ) -> RadixNode:
+        """Insert *pages* as a single compressed leaf child of *parent*.
 
-        # Determine effective hit depth (gated by Mamba state in hybrid mode).
-        if self._mamba_state_token_equiv > 0:
-            effective_hit_idx = -1
-            for i, n in enumerate(matched_nodes):
-                if n.has_mamba_state:
-                    effective_hit_idx = i
-            if effective_hit_idx >= 0:
-                hit_pages = cum_pages[effective_hit_idx]
-                hit_tokens = cum_tokens[effective_hit_idx]
-            else:
-                hit_pages = 0
-                hit_tokens = 0
-        else:
-            hit_pages = total_matched_pages
-            hit_tokens = total_matched_tokens
+        The leaf is marked ``is_turn_end=True``.  Caller is responsible
+        for ensuring *parent* does not already have a child with the
+        same first-page key (typically by walking via ``match_and_split``
+        and only inserting the leftover suffix).
+        """
+        assert pages, "insert_leaf_at requires at least one page"
+        assert pages[0] not in parent.children, (
+            "insert_leaf_at: parent already has a child with this first page"
+        )
+        ts = timestamp if timestamp is not None else self._clock
+        self._leaf_set.discard(parent)
+        order = self._next_creation_order()
+        child_tokens = sum(len(p) for p in pages)
+        child = RadixNode(
+            pages=pages,
+            num_tokens=child_tokens,
+            parent=parent,
+            creation_order=order,
+            depth_tokens=parent.depth_tokens + child_tokens,
+            access_count=access_count,
+            last_access=ts,
+            is_turn_end=True,
+        )
+        parent.children[pages[0]] = child
+        self._add_token_count(child_tokens)
+        self._leaf_set.add(child)
+        return child
 
-        # Turn hit: tokens up to the deepest is_turn_end node within effective hit range.
-        effective_range = (effective_hit_idx + 1) if self._mamba_state_token_equiv > 0 else len(matched_nodes)
-        turn_hit_tokens = 0
-        for i in range(effective_range):
-            if matched_nodes[i].is_turn_end:
-                turn_hit_tokens = cum_tokens[i]
+    def set_mamba_at_depth(
+        self, pages: List[PageKey], depth: int
+    ) -> Optional[RadixNode]:
+        """Walk *pages* from root and set mamba state at the page-boundary
+        node ending at the smallest depth ``>= depth`` along this path.
 
-        # Insert remaining suffix as a single compressed node.
-        new_nodes: List[RadixNode] = []
+        If the requested depth falls inside a multi-page compressed
+        node, the node is split at the smallest internal page boundary
+        ``>= depth``.  This matches the mid-chain checkpoint behaviour
+        of the original Marconi2/3 strategies.
+
+        Returns the targeted node, or ``None`` if the path is shorter
+        than ``depth`` or ``depth <= 0``.
+        """
+        if depth <= 0:
+            return None
+        node = self._root
+        page_idx = 0
+        cum = 0
+        while page_idx < len(pages):
+            ch = node.children.get(pages[page_idx])
+            if ch is None:
+                return None
+            ch_end = cum + ch.num_tokens
+            if ch_end >= depth:
+                # The target lands inside (or at the end of) ``ch``.
+                # Find the smallest page boundary at or past ``depth``.
+                offset = depth - cum
+                cum_in_ch = 0
+                pages_to_keep = 0
+                for p in ch.pages:
+                    cum_in_ch += len(p)
+                    pages_to_keep += 1
+                    if cum_in_ch >= offset:
+                        break
+                if pages_to_keep < ch.num_pages and pages_to_keep > 0:
+                    self.split_node(ch, pages_to_keep)
+                # ``ch`` is now the prefix node ending at the chosen boundary.
+                self.set_mamba_state(ch)
+                return ch
+            cum = ch_end
+            page_idx += ch.num_pages
+            node = ch
+        return None
+
+    # ------------------------------------------------------------------
+    # Legacy: match + insert in one shot (used only by oracle/global-tree
+    # builders that need to populate a tree from a request stream without
+    # going through the strategy/op pipeline).
+    # ------------------------------------------------------------------
+
+    def simulate_request(self, pages: List[PageKey]) -> List[RadixNode]:
+        """Walk + split + insert remaining suffix as a single leaf.
+
+        Convenience wrapper around :meth:`match_and_split` and
+        :meth:`insert_leaf_at`.  Used by the oracle global-tree
+        constructors which don't need the strategy/op pipeline.
+
+        Returns the matched_nodes list (the inserted leaf, if any, is
+        appended).
+        """
+        matched_nodes, page_idx = self.match_and_split(pages)
         remaining = pages[page_idx:]
-        is_branch = bool(remaining) and len(node.children) > 0
-        is_new_branch = is_branch and not node.has_mamba_state
         if remaining:
-            self._leaf_set.discard(node)
-            order = self._next_creation_order()
-            child = RadixNode(
-                pages=tuple(remaining),
-                num_tokens=sum(len(p) for p in remaining),
-                parent=node,
-                creation_order=order,
-            )
-            child.touch(ts)
-            node.children[remaining[0]] = child
-            self._add_token_count(child.num_tokens)
-            new_nodes.append(child)
-            self._leaf_set.add(child)
-            node = child
-
-        node.is_turn_end = True
-
-        total_tokens = sum(len(x) for x in pages)
-        return hit_pages, hit_tokens, total_tokens, turn_hit_tokens, new_nodes, matched_nodes, is_branch, is_new_branch
+            parent = matched_nodes[-1] if matched_nodes else self._root
+            leaf = self.insert_leaf_at(parent, tuple(remaining))
+            matched_nodes.append(leaf)
+        elif matched_nodes:
+            matched_nodes[-1].is_turn_end = True
+        return matched_nodes
 
     # ------------------------------------------------------------------
     # Leaf / mamba accessors (backed by incremental indexes)
@@ -372,133 +421,6 @@ class RadixTree:
     def mamba_state_node_set(self) -> Set[RadixNode]:
         """Direct access to the mamba state node set (read-only view — do not mutate)."""
         return self._mamba_state_nodes
-
-    # ------------------------------------------------------------------
-    # Read-only prefix match (no insertion, no clock advance)
-    # ------------------------------------------------------------------
-
-    def prefix_match(
-        self, pages: List[PageKey]
-    ) -> Tuple[int, int, List[RadixNode]]:
-        """Match longest page prefix without inserting or advancing clock.
-
-        Returns
-        -------
-        matched_pages : int
-        matched_tokens : int
-        matched_nodes : List[RadixNode]
-        """
-        node = self._root
-        matched_nodes: List[RadixNode] = []
-        page_idx = 0
-
-        while page_idx < len(pages):
-            ch = node.children.get(pages[page_idx])
-            if ch is None:
-                break
-
-            ch_pages = ch.pages
-            match_len = 0
-            for i in range(len(ch_pages)):
-                if page_idx + i >= len(pages) or pages[page_idx + i] != ch_pages[i]:
-                    break
-                match_len += 1
-            else:
-                match_len = len(ch_pages)
-
-            if match_len == len(ch_pages):
-                matched_nodes.append(ch)
-                node = ch
-                page_idx += len(ch_pages)
-            elif match_len > 0:
-                # Partial match — don't split (read-only), count partial pages.
-                # We report matched pages up to the partial match boundary.
-                # Since we can't split, we report the full-node matches so far.
-                break
-            else:
-                break
-
-        total_pages = sum(n.num_pages for n in matched_nodes)
-        total_tokens = sum(n.num_tokens for n in matched_nodes)
-        return total_pages, total_tokens, matched_nodes
-
-    # ------------------------------------------------------------------
-    # Insert pages (for demotion / external insertion, no clock advance)
-    # ------------------------------------------------------------------
-
-    def insert_pages(
-        self,
-        pages: List[PageKey],
-        timestamp: int = 0,
-        access_count: int = 1,
-    ) -> List[RadixNode]:
-        """Insert a page sequence into the tree without advancing the clock.
-
-        Walks the tree to find the longest existing prefix, then inserts the
-        remaining suffix as a new compressed node.  Existing nodes along the
-        matched prefix are *not* touched (their ``last_access`` / ``access_count``
-        are left unchanged).
-
-        Parameters
-        ----------
-        pages:
-            Full page sequence from root to leaf.
-        timestamp:
-            ``last_access`` value to assign to newly created nodes.
-        access_count:
-            ``access_count`` value to assign to newly created nodes.
-
-        Returns
-        -------
-        new_nodes : List[RadixNode]
-            Newly created nodes (empty if fully matched).
-        """
-        node = self._root
-        page_idx = 0
-
-        while page_idx < len(pages):
-            ch = node.children.get(pages[page_idx])
-            if ch is None:
-                break
-
-            ch_pages = ch.pages
-            match_len = 0
-            for i in range(len(ch_pages)):
-                if page_idx + i >= len(pages) or pages[page_idx + i] != ch_pages[i]:
-                    break
-                match_len += 1
-            else:
-                match_len = len(ch_pages)
-
-            if match_len == len(ch_pages):
-                node = ch
-                page_idx += len(ch_pages)
-            else:
-                # Partial match — split the existing node.
-                self.split_node(ch, match_len)
-                node = ch  # ch is now the prefix after split
-                page_idx += match_len
-                break
-
-        new_nodes: List[RadixNode] = []
-        remaining = pages[page_idx:]
-        if remaining:
-            self._leaf_set.discard(node)
-            order = self._next_creation_order()
-            child = RadixNode(
-                pages=tuple(remaining),
-                num_tokens=sum(len(p) for p in remaining),
-                parent=node,
-                creation_order=order,
-                last_access=timestamp,
-                access_count=access_count,
-            )
-            node.children[remaining[0]] = child
-            self._add_token_count(child.num_tokens)
-            new_nodes.append(child)
-            self._leaf_set.add(child)
-
-        return new_nodes
 
     # ------------------------------------------------------------------
     # Removal

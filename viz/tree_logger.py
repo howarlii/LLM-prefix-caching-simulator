@@ -30,14 +30,18 @@ def _log_filename(
     page_size: int,
     capacity_spec: str,
     ordering: str = "original",
-    mamba_equiv: int = 0,
+    model_name: str | None = None,
     **_extra: object,
 ) -> str:
-    """Build a deterministic filename encoding all simulation parameters."""
+    """Build a deterministic filename encoding all simulation parameters.
+
+    ``model_name`` is appended (when provided) so logs from different
+    architectures don't collide.
+    """
     cap = str(capacity_spec).replace(" ", "")
     name = f"{dataset}_ps{page_size}_{ordering}_{strategy}_cap{cap}"
-    if mamba_equiv > 0:
-        name += f"_mamba{mamba_equiv}"
+    if model_name:
+        name += f"_{model_name}"
     return name + ".jsonl"
 
 

@@ -5,11 +5,11 @@ Python simulator for **prefix KV cache** behavior on LLM serving workloads: page
 ## Layout
 
 - `src/radix_tree.py` — page-level radix tree (one node per page of token ids).
-- `src/cache_simulator.py` — request loop, capacity enforcement, `MultiTierCacheSimulator` stub for future multi-tier host-cache modeling.
+- `src/cache_simulator.py` — request loop and capacity enforcement. Supports an optional DRAM tier (enabled when both `dram_strategy` and `dram_capacity_tokens > 0` are provided).
 - `src/strategies/` — eviction policies implementing `EvictionStrategy`.
 - `src/datasets_loader.py` — Hugging Face datasets → text requests (LooGLE, NarrativeQA, ShareGPT; ReviewMT skipped by default).
 - `src/request_generator.py` — Qwen3 tokenizer, on-disk tokenization cache, ordering modes.
-- `src/metrics.py` — aggregate metrics (page/token hit rate, per-request distribution, load/compute ratio, tree stats).
+- `src/metrics.py` — aggregate metrics (per-tier hit rates, per-request saved-time distribution, load/compute ratio, FLOP counts and savings, GPU+PCIe wall-clock breakdown, tree stats).
 - `experiments/` — CLI sweeps and `run_all.py`.
 - `analysis/plot_results.ipynb` — matplotlib plots from `results/*.csv`.
 
@@ -66,4 +66,4 @@ Results go to `results/` as CSV + per-run JSON.
 ## Optional / future
 
 - **ReviewMT**: not wired (returns empty list); extend `datasets_loader.py` when a stable source is available.
-- **Multi-tier cache**: `MultiTierCacheSimulator` raises `NotImplementedError` until implemented.
+- **Two-tier cache (HBM + DRAM)**: enable by passing `dram_strategy` + `dram_capacity_tokens > 0` to `KVCacheSimulator` (or `--dram-strategy` / `--dram-capacity` to `experiments/run_one.py`). Reports `hbm_token_hit_rate`, `dram_token_hit_rate`, promotion / demotion volume, and PCIe transfer time.

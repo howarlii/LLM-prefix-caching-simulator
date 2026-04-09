@@ -38,6 +38,7 @@
 build/
 bin/
 .cache/
+.claude/
 .venv/
 
 # vscode

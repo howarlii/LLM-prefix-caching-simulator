@@ -126,22 +126,16 @@ class CRFDecouplingStrategy(EvictionStrategy):
                 _update_crf(node, ts, ld)
                 break
 
-    def on_new_nodes_inserted(
+    def on_nodes_inserted(
         self, tree: RadixTree, new_nodes: List[RadixNode]
     ) -> None:
+        """Initialise CRF on new nodes that received mamba state."""
         if tree.mamba_state_token_equiv == 0:
             return
         ts = tree.clock
         for node in new_nodes:
             if node.has_mamba_state:
                 _set_crf(node, _DEFAULT_CRF, ts)
-
-    # ------------------------------------------------------------------
-    # Admission
-    # ------------------------------------------------------------------
-
-    def admit_mamba_state(self, node: RadixNode) -> bool:
-        return True
 
     # ------------------------------------------------------------------
     # Scoring helpers

@@ -7,6 +7,10 @@ Execution is split into two phases:
   2. **Simulate** — run all simulations in a bounded ``multiprocessing.Pool``.
 
 Edit the configuration section below to set up runs.
+
+Two-tier (HBM + DRAM) caching is enabled per-experiment by setting both
+``dram_strategy`` (non-empty) and ``dram_capacity`` (non-zero, finite).
+Otherwise the run is single-tier (HBM only).
 """
 
 from __future__ import annotations
@@ -22,14 +26,18 @@ _ROOT = Path(__file__).resolve().parents[1]
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
-from src.config import DEFAULT_TOKENIZER_NAME, RESULTS_DIR
+from src.config import (
+    DEFAULT_GPU_FLOPS,
+    DEFAULT_PCIE_BANDWIDTH,
+    DEFAULT_TOKENIZER_NAME,
+    RESULTS_DIR,
+)
 from src.model_config import DEFAULT_MODEL, ModelConfig
 from experiments.runner import (
     capacity_from_spec,
     effective_page_size,
     persist_result_row,
     prepare_requests,
-    run_multi_tier_simulation,
     run_simulation,
     strategy_from_name,
 )
@@ -44,34 +52,30 @@ DATASET         = "swesmith" # swesmith | loogle | narrativeqa | sharegpt_90k_ra
 PAGE_SIZE       = 32
 ORDERING        = "timestamp"  # original | min_distance | max_distance | random | timestamp
 STRATEGY        = "marconi"
-CAPACITY        = "160"          # GB, or "inf"/"unlimited"
+CAPACITY        = "160"          # GB, or "inf"/"unlimited" — HBM tier
 MODEL_NAME      = DEFAULT_MODEL.name  # see ModelConfig.list_models() for options
 TOKENIZER       = DEFAULT_TOKENIZER_NAME
 SEED            = 0
 MAX_REQUESTS    = 5000
 TOKENIZE_WORKERS = 90
 
+# ── Hardware throughput (used by saved-time metrics) ────────────────────────
+GPU_FLOPS       = DEFAULT_GPU_FLOPS       # FLOP/sec; H100 BF16 dense
+PCIE_BANDWIDTH  = DEFAULT_PCIE_BANDWIDTH  # bytes/sec; PCIe Gen5 x16
+
 # ── Strategy-specific parameters ────────────────────────────────────────────
 # These are passed to strategy constructors when strategy_from_name is called.
 # Set to None to use the strategy's built-in default.
-#
-# Marconi / Marconi2:
-MARCONI_ALPHA   = None           # default: 1.5 for marconi, 1.5 for marconi2
-#
-# CRF Decoupling:
+MARCONI_ALPHA    = None         # default: 1.5 for marconi, 1.5 for marconi2
 CRF_LAMBDA_DECAY = None         # default: 0.5
 CRF_C_ATTN       = None         # default: 1.0
 CRF_C_SSM        = None         # default: 1.0
 
-# ── Multi-tier (HBM + DRAM) cache ───────────────────────────────────────────
-# Set MULTI_TIER=True to run two-tier simulations. When enabled, CAPACITY/STRATEGY
-# above are ignored; HBM_*/DRAM_* take over. Per-experiment overrides via
-# "multi_tier", "hbm_capacity", "dram_capacity", "hbm_strategy", "dram_strategy".
-MULTI_TIER      = False
-HBM_CAPACITY    = "20"           # GB (must be finite)
-DRAM_CAPACITY   = "160"          # GB (must be finite)
-HBM_STRATEGY    = "branch"       # eviction policy for HBM tier
-DRAM_STRATEGY   = "marconi3_ev1_mn0"  # eviction policy for DRAM tier
+# ── DRAM tier defaults ──────────────────────────────────────────────────────
+# Two-tier mode is enabled when DRAM_STRATEGY is non-empty AND DRAM_CAPACITY > 0.
+# Per-experiment overrides via "dram_strategy" / "dram_capacity".
+DRAM_STRATEGY    = None         # e.g. "marconi3_ev1_mn0" — None disables DRAM
+DRAM_CAPACITY    = "0"          # GB (must be finite); "0" disables DRAM
 
 # ── Logging (viz) ───────────────────────────────────────────────────────────
 ENABLE_LOG      = False          # True = write tree-mutation JSONL per experiment
@@ -83,34 +87,42 @@ MAX_WORKERS     = 100
 # ── Experiment list ─────────────────────────────────────────────────────────
 # Each dict is one simulation run.  Keys override the global defaults above.
 # Strategy params can be set per-experiment via "marconi_alpha", "crf_lambda_decay", etc.
-#
-# Shorthand: omit any key to use the global default.
 EXPERIMENTS: list[dict] = []
 
-# Example: sweep page_size × capacity for marconi and marconi2
+# Example: sweep page_size × capacity for marconi3 ablations
 for ds in ["swesmith", "loogle", "narrativeqa", "sharegpt_90k_raw"]:
 # for ds in ["swesmith"]:
-    # for page_size in [1, 32, 256, 1024]:
-    for page_size in [1, 32, 256]:
-        for capacity in [80, 160, "inf"]:
-            # EXPERIMENTS.append(dict(page_size=page_size, dataset=ds, strategy="lru",  capacity=capacity))
-            # EXPERIMENTS.append(dict(page_size=page_size, dataset=ds, strategy="marconi",  capacity=capacity))
-            # EXPERIMENTS.append(dict(page_size=page_size, dataset=ds, strategy="marconi3_ev0_mn0", capacity=capacity))
-            # EXPERIMENTS.append(dict(page_size=page_size, dataset=ds, strategy="marconi3", capacity=capacity))
-            # EXPERIMENTS.append(dict(page_size=page_size, dataset=ds, strategy="marconi3_ev1_mn0", capacity=capacity))
-            # EXPERIMENTS.append(dict(page_size=page_size, dataset=ds, strategy="marconi3_ev1_mn1", capacity=capacity))
-            EXPERIMENTS.append(dict(page_size=page_size, dataset=ds, strategy="marconi3_ev0_mn0", capacity=capacity))
+    for page_size in [32]:
+        for capacity in [20, 40, 80, 160, "inf"]:
+        # for capacity in [20]:
+            # EXPERIMENTS.append(dict(page_size=page_size, dataset=ds, strategy="marconi3_ev1_nt", capacity=capacity))
+            EXPERIMENTS.append(dict(page_size=page_size, dataset=ds, strategy="branch_nt", capacity=capacity))
+
+# Two-tier examples: HBM=branch_nt at small capacity, DRAM=marconi3_ev1_nt at large capacity.
+for ds in ["swesmith", "loogle", "narrativeqa", "sharegpt_90k_raw"]:
+    for page_size in [32]:
+        for hbm_cap in [10, 20, 40, 80, "inf"]:
+        # for hbm_cap in [40, 80, 160]:
+            EXPERIMENTS.append(dict(
+                page_size=page_size, dataset=ds,
+                strategy="branch_nt", capacity=hbm_cap,
+                dram_strategy="marconi3_ev1_nt", dram_capacity="inf",
+            ))
+            EXPERIMENTS.append(dict(
+                page_size=page_size, dataset=ds,
+                strategy="marconi3_ev1_nt", capacity=hbm_cap,
+                dram_strategy="marconi3_ev1_nt", dram_capacity="inf",
+            ))
 
 # Log datasets
-ENABLE_LOG      = True
-MAX_REQUESTS    = 1000
-# capacity = "inf"
-EXPERIMENTS: list[dict] = []
-for ds in ["swesmith", "loogle", "narrativeqa", "sharegpt_90k_raw"]:
-    for page_size in [1, 32]:
-        for capacity in [20, 80, "inf"]:
-            EXPERIMENTS.append(dict(page_size=page_size, strategy="marconi3_ev1_mn0",  capacity=capacity, dataset=ds))
-            EXPERIMENTS.append(dict(page_size=page_size, strategy="branch_nt",  capacity=capacity, dataset=ds))
+# ENABLE_LOG      = True
+# MAX_REQUESTS    = 1000
+# EXPERIMENTS: list[dict] = []
+# for ds in ["swesmith", "loogle", "narrativeqa", "sharegpt_90k_raw"]:
+#     for page_size in [1, 32]:
+#         for capacity in [20, 80, "inf"]:
+#             EXPERIMENTS.append(dict(page_size=page_size, strategy="marconi3_ev1_mn0",  capacity=capacity, dataset=ds))
+#             EXPERIMENTS.append(dict(page_size=page_size, strategy="branch_nt",  capacity=capacity, dataset=ds))
 
 # ╔═══════════════════════════════════════════════════════════════════════════╗
 # ║                       END OF CONFIGURATION                                ║
@@ -135,22 +147,23 @@ def _merge_defaults(cfg: dict) -> dict:
         "crf_lambda_decay":       cfg.get("crf_lambda_decay", CRF_LAMBDA_DECAY),
         "crf_c_attn":             cfg.get("crf_c_attn", CRF_C_ATTN),
         "crf_c_ssm":              cfg.get("crf_c_ssm", CRF_C_SSM),
-        # Multi-tier params
-        "multi_tier":             cfg.get("multi_tier", MULTI_TIER),
-        "hbm_capacity":           cfg.get("hbm_capacity", HBM_CAPACITY),
-        "dram_capacity":          cfg.get("dram_capacity", DRAM_CAPACITY),
-        "hbm_strategy":           cfg.get("hbm_strategy", HBM_STRATEGY),
+        # DRAM tier
         "dram_strategy":          cfg.get("dram_strategy", DRAM_STRATEGY),
+        "dram_capacity":          cfg.get("dram_capacity", DRAM_CAPACITY),
+        # Hardware throughput
+        "gpu_flops":              cfg.get("gpu_flops", GPU_FLOPS),
+        "pcie_bandwidth":         cfg.get("pcie_bandwidth", PCIE_BANDWIDTH),
     }
 
 
-def _build_strategy_name(cfg: dict) -> str:
+def _build_strategy_name(name: Optional[str], cfg: dict) -> Optional[str]:
     """Build the strategy string, embedding params as suffix when set.
 
     e.g. "marconi" with alpha=2.0 → "marconi_2.0"
          "crf_decoupling" with lambda=0.01 → "crf_decoupling_0.01"
     """
-    name = cfg["strategy"]
+    if not name:
+        return None
     n = name.lower()
 
     if n in ("marconi", "marconi2") and cfg.get("marconi_alpha") is not None:
@@ -162,22 +175,21 @@ def _build_strategy_name(cfg: dict) -> str:
     return name
 
 
+def _dram_enabled(cfg: dict) -> bool:
+    return bool(cfg.get("dram_strategy")) and str(cfg.get("dram_capacity", "0")).strip() not in ("", "0")
+
+
 def _label(cfg: dict) -> str:
-    if cfg.get("multi_tier"):
-        return (
-            f"{cfg.get('dataset','?')} "
-            f"ps={cfg.get('page_size','?')} "
-            f"{cfg.get('ordering','?')} "
-            f"hbm:{cfg.get('hbm_strategy','?')}/{cfg.get('hbm_capacity','?')} "
-            f"dram:{cfg.get('dram_strategy','?')}/{cfg.get('dram_capacity','?')}"
-        )
-    return (
+    base = (
         f"{cfg.get('dataset','?')} "
         f"ps={cfg.get('page_size','?')} "
         f"{cfg.get('ordering','?')} "
         f"{cfg.get('strategy','?')} "
         f"cap={cfg.get('capacity','?')}"
     )
+    if _dram_enabled(cfg):
+        base += f" dram:{cfg['dram_strategy']}/{cfg['dram_capacity']}"
+    return base
 
 
 # ── Populated by main() before forking — child processes see it via COW ──────
@@ -190,21 +202,20 @@ def _sim_worker(args: Tuple) -> Dict[str, Any]:
     reqs = _PREPARED[prep_key]
     model = ModelConfig.from_name(cfg["model_name"])
 
-    if cfg.get("multi_tier"):
-        hbm_strat = strategy_from_name(sim_spec["hbm_strategy"], model=model)
-        dram_strat = strategy_from_name(sim_spec["dram_strategy"], model=model)
-        # NOTE: TreeLogger is not currently wired through run_multi_tier_simulation.
-        metrics = run_multi_tier_simulation(
-            reqs, page_size, hbm_strat, dram_strat,
-            hbm_capacity_tokens=sim_spec["hbm_cap"],
-            dram_capacity_tokens=sim_spec["dram_cap"],
+    strategy = strategy_from_name(
+        sim_spec["strategy_name"],
+        model=model,
+        gpu_flops=cfg["gpu_flops"],
+        pcie_bandwidth=cfg["pcie_bandwidth"],
+    )
+    dram_strategy = None
+    if sim_spec.get("dram_strategy_name"):
+        dram_strategy = strategy_from_name(
+            sim_spec["dram_strategy_name"],
             model=model,
+            gpu_flops=cfg["gpu_flops"],
+            pcie_bandwidth=cfg["pcie_bandwidth"],
         )
-        return {"cfg": cfg, "metrics": metrics.to_dict()}
-
-    strategy_name = sim_spec["strategy_name"]
-    cap = sim_spec["cap"]
-    strategy = strategy_from_name(strategy_name, model=model)
 
     logger = None
     if ENABLE_LOG:
@@ -212,16 +223,24 @@ def _sim_worker(args: Tuple) -> Dict[str, Any]:
         log_dir.mkdir(parents=True, exist_ok=True)
         fname = _log_filename(
             dataset=cfg["dataset"],
-            strategy=strategy_name,
+            strategy=sim_spec["strategy_name"],
             page_size=page_size,
             capacity_spec=str(cfg["capacity"]),
             ordering=cfg["ordering"],
-            mamba_equiv=model.mamba_state_token_equiv,
+            model_name=model.name,
         )
         logger = TreeLogger(log_dir / fname)
 
     try:
-        metrics = run_simulation(reqs, page_size, strategy, cap, logger=logger, model=model)
+        metrics = run_simulation(
+            reqs, page_size, strategy, sim_spec["cap"],
+            dram_strategy=dram_strategy,
+            dram_capacity_tokens=sim_spec.get("dram_cap", 0),
+            logger=logger,
+            model=model,
+            gpu_flops=cfg["gpu_flops"],
+            pcie_bandwidth=cfg["pcie_bandwidth"],
+        )
     finally:
         if logger is not None:
             logger.close()
@@ -275,26 +294,16 @@ def main() -> None:
         for cfg in cfgs:
             model = ModelConfig.from_name(cfg["model_name"])
             page_size = effective_page_size(cfg["dataset"], int(cfg["page_size"]))
-            if cfg.get("multi_tier"):
-                hbm_cap = capacity_from_spec(str(cfg["hbm_capacity"]), model=model)
+            cap = capacity_from_spec(str(cfg["capacity"]), model=model)
+            sim_spec: Dict[str, Any] = {
+                "strategy_name": _build_strategy_name(cfg["strategy"], cfg),
+                "cap": cap,
+            }
+            if _dram_enabled(cfg):
+                # capacity_from_spec returns None for "inf" → unlimited DRAM.
                 dram_cap = capacity_from_spec(str(cfg["dram_capacity"]), model=model)
-                if hbm_cap is None or dram_cap is None:
-                    raise SystemExit(
-                        f"multi_tier requires finite hbm_capacity/dram_capacity (got "
-                        f"hbm={cfg['hbm_capacity']!r}, dram={cfg['dram_capacity']!r})"
-                    )
-                sim_spec = {
-                    "hbm_strategy": cfg["hbm_strategy"],
-                    "dram_strategy": cfg["dram_strategy"],
-                    "hbm_cap": hbm_cap,
-                    "dram_cap": dram_cap,
-                }
-            else:
-                cap = capacity_from_spec(str(cfg["capacity"]), model=model)
-                sim_spec = {
-                    "strategy_name": _build_strategy_name(cfg),
-                    "cap": cap,
-                }
+                sim_spec["dram_strategy_name"] = _build_strategy_name(cfg["dram_strategy"], cfg)
+                sim_spec["dram_cap"] = dram_cap
             sim_args.append((prep_key, page_size, sim_spec, cfg))
 
     print(
@@ -307,7 +316,7 @@ def main() -> None:
     failed: List[str] = []
     done = 0
 
-    with ctx.Pool(processes=MAX_WORKERS) as pool:
+    with ctx.Pool(processes=min(MAX_WORKERS, len(EXPERIMENTS))) as pool:
         for result in pool.imap_unordered(_sim_worker, sim_args):
             cfg = result["cfg"]
             metrics_dict = result["metrics"]
@@ -317,41 +326,45 @@ def main() -> None:
             out_csv = RESULTS_DIR / f"results_{dataset}.csv"
             out_json_dir = RESULTS_DIR / f"json_{dataset}"
 
-            model = ModelConfig.from_name(cfg["model_name"])
-            if cfg.get("multi_tier"):
-                strategy_label = f"hbm:{cfg['hbm_strategy']}_dram:{cfg['dram_strategy']}"
-                capacity_label = f"hbm{cfg['hbm_capacity']}_dram{cfg['dram_capacity']}"
-            else:
-                strategy_label = _build_strategy_name(cfg)
-                capacity_label = str(cfg["capacity"])
+            strategy_label = _build_strategy_name(cfg["strategy"], cfg)
+            dram_enabled = _dram_enabled(cfg)
+            dram_strategy_label = (
+                _build_strategy_name(cfg["dram_strategy"], cfg) or "" if dram_enabled else ""
+            )
+            dram_capacity_label = str(cfg["dram_capacity"]) if dram_enabled else ""
             row = {
                 "dataset": dataset,
                 "page_size": effective_page_size(dataset, int(cfg["page_size"])),
                 "ordering": cfg["ordering"],
                 "strategy": strategy_label,
-                "capacity_spec": capacity_label,
+                "capacity_spec": str(cfg["capacity"]),
+                "dram_strategy": dram_strategy_label,
+                "dram_capacity_spec": dram_capacity_label,
                 "tokenizer": cfg["tokenizer"],
-                "mamba_state_token_equiv": model.mamba_state_token_equiv,
                 "model_name": cfg["model_name"],
+                "gpu_flops": cfg["gpu_flops"],
+                "pcie_bandwidth": cfg["pcie_bandwidth"],
                 "metrics": metrics_dict,
             }
             persist_result_row(out_csv, out_json_dir, row)
 
             done += 1
-            token_hr = metrics_dict.get("token_level_hit_rate", 0)
+            hbm_hr = metrics_dict.get("hbm_token_hit_rate", 0)
+            dram_hr = metrics_dict.get("dram_token_hit_rate", 0)
+            total_hr = hbm_hr + dram_hr
             branch_r = metrics_dict.get("req_branch_rate", 0)
             new_branch_r = metrics_dict.get("req_new_branch_rate", 0)
-            flops_sr = metrics_dict.get("flops_save_rate")
-            flops_str = f"  flops_save={flops_sr:.4f}" if flops_sr is not None else ""
-            if cfg.get("multi_tier"):
-                hbm_hr = metrics_dict.get("hbm_token_hit_rate", 0)
-                dram_hr = metrics_dict.get("dram_token_hit_rate", 0)
+            flop_sr = metrics_dict.get("flop_save_rate")
+            flop_str = f"  flop_save={flop_sr:.4f}" if flop_sr is not None else ""
+            saved_t = metrics_dict.get("total_saved_time")
+            saved_str = f"  saved_time={saved_t:.2f}s" if saved_t is not None else ""
+            if dram_enabled:
                 tier_str = f"  hbm_hr={hbm_hr:.4f}  dram_hr={dram_hr:.4f}"
             else:
                 tier_str = ""
             print(
                 f"  [{done}/{len(sim_args)}] {label}  "
-                f"token_hr={token_hr:.4f}{tier_str}  branch_rate={branch_r:.4f}  new_branch_rate={new_branch_r:.4f}{flops_str}",
+                f"token_hr={total_hr:.4f}{tier_str}  branch_rate={branch_r:.4f}  new_branch_rate={new_branch_r:.4f}{flop_str}{saved_str}",
                 flush=True,
             )
 

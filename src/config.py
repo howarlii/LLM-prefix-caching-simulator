@@ -36,6 +36,13 @@ def ensure_hf_cache_dirs() -> None:
 # Approximate KV bytes per token (fp16), ~28 layers × 4096 dim × 2 (K+V) × 2 bytes
 KV_BYTES_PER_TOKEN_DEFAULT = 2 * 28 * 4096 * 2
 
+# ── Hardware throughput defaults ────────────────────────────────────────────
+# Used by metrics to convert FLOP counts and DRAM cache transfer volume into
+# wall-clock seconds.  Pass overrides explicitly to compute_run_metrics /
+# run_simulation; these are *defaults* for the entry-point CLIs only.
+DEFAULT_GPU_FLOPS = 989e12  * 0.2        # H100 SXM5 BF16 dense (~989 TFLOP/s), effictive 20%
+DEFAULT_PCIE_BANDWIDTH = 16 * 4e9 * 0.5  # 50% of PCIe Gen5 x16 (64 GB/s), according to Strata
+
 
 def gb_to_token_capacity(gb: float, kv_bytes_per_token: int = KV_BYTES_PER_TOKEN_DEFAULT) -> int:
     """Convert cache capacity in GB to an equivalent token budget."""

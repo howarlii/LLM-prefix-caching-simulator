@@ -73,9 +73,8 @@ RawRequest (text + group_id)
 - `valid_cached_depth_histogram()`: key metric for branching mass — nodes with >1 child contribute (x-1) to their depth, representing wasted/shared cache capacity.
 
 **`KVCacheSimulator` (`src/cache_simulator.py`)**
-- Owns one `RadixTree` and one `EvictionStrategy`.
-- `process_token_ids(token_ids)`: splits into pages → `tree.simulate_request()` → `_evict_until_fit()` (one leaf at a time via `strategy.select_nodes()`).
-- `MultiTierCacheSimulator` is a stub that raises `NotImplementedError`.
+- Owns a primary HBM `RadixTree` and an `EvictionStrategy`. An optional DRAM tier (second `RadixTree` + its own strategy) is enabled when `dram_strategy is not None` AND `dram_capacity_tokens > 0`; otherwise it runs as a single-tier HBM cache.
+- `process_token_ids(token_ids)`: splits into pages → `tree.simulate_request()` (HBM) → optional read-only `dram_tree.prefix_match()` for extra hits → `_evict_until_fit()` (HBM eviction demotes leaf paths to DRAM, then DRAM eviction discards).
 
 **`EvictionStrategy` (`src/strategies/base.py`)**
 - Abstract interface: `select_nodes(tree, num_nodes) → List[RadixNode]`.
@@ -92,8 +91,10 @@ RawRequest (text + group_id)
 - `load_raw_requests()` is the entry point; results can be saved/loaded via `save_manifest()` / `load_manifest()`.
 
 **`metrics.py`**
-- `compute_run_metrics()` aggregates: page/token/turn-level hit rates, per-request hit rate percentiles, load/compute ratio, peak/avg cached tokens, tree depth histogram, access-count percentiles per depth.
-- `turn_level_hit_rate` tracks tokens in hit pages where the child node was marked `is_turn_end` (continuation of a prior conversation turn).
+- `compute_run_metrics()` aggregates: per-tier hit rates (`hbm_token_hit_rate`, `dram_token_hit_rate`), load/compute ratio, peak/avg cached tokens (HBM and DRAM), tree depth histogram, access-count percentiles per depth, and wall-clock savings.
+- **Wall-clock model**: GPU compute time = `flop / gpu_flops`. DRAM cache hits incur a PCIe transfer cost = `dram_hit_bytes / pcie_bandwidth`. `total_saved_time = gpu_compute_time_no_cache − gpu_compute_time_with_cache − pcie_total_transfer_time`. Per-request percentiles are reported as `per_request_saved_time_{mean,p50,p90,p99}`.
+- **Hardware throughput** (`gpu_flops`, `pcie_bandwidth`) are passed as keyword arguments to `compute_run_metrics()` and `run_simulation()` — they are *not* fields on `ModelConfig`. Defaults live in `src/config.py` (`DEFAULT_GPU_FLOPS`, `DEFAULT_PCIE_BANDWIDTH`); CLI overrides via `run_one.py`'s `--gpu-flops` / `--pcie-bandwidth` flags or `run_all.py`'s `GPU_FLOPS` / `PCIE_BANDWIDTH` constants.
+- **Naming convention**: `flop` = a count of floating-point ops (extensive); `flops` = ops/sec (rate). Use `flop_save_rate`, `total_flop_*`, `prefill_flop()`, but `gpu_flops` (a throughput).
 
 ## KV Capacity Heuristic
 

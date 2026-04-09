@@ -59,8 +59,15 @@ from __future__ import annotations
 from collections import deque
 from typing import List, Optional, Tuple
 
-from src.radix_tree import RadixNode, RadixTree
-from src.strategies.base import EvictOp, EvictionStrategy
+from src.model_config import DEFAULT_MODEL, ModelConfig
+from src.radix_tree import PageKey, RadixNode, RadixTree
+from src.strategies.base import (
+    EvictOp,
+    EvictionStrategy,
+    PageStatus,
+    RequestPlan,
+    compute_min_mamba_admit_depth,
+)
 
 
 def _effective_ts(node: RadixNode) -> int:
@@ -79,38 +86,82 @@ class BranchStrategy(EvictionStrategy):
         If ``True`` ("branch_nt"), only the deepest matched node and
         selected ancestor checkpoints are refreshed (see module docstring
         for the precise rule).
+    model:
+        Architecture description; used (with ``gpu_flops`` /
+        ``pcie_bandwidth``) to compute a hardware-aware depth threshold
+        below which admitting a Mamba state would cost more (PCIe load
+        time) than recomputing the prefix from scratch.
+    gpu_flops / pcie_bandwidth:
+        Hardware throughput for the depth-threshold check.  When either
+        is missing the filter is disabled and the strategy admits states
+        regardless of depth (matching the original behaviour).
     """
 
-    def __init__(self, newtouch: bool = False) -> None:
+    def __init__(
+        self,
+        newtouch: bool = False,
+        model: ModelConfig = DEFAULT_MODEL,
+        gpu_flops: Optional[float] = None,
+        pcie_bandwidth: Optional[float] = None,
+    ) -> None:
         self.newtouch = newtouch
-
-    @property
-    def drop_partial_last_page(self) -> bool:
-        return True
+        self.model = model
+        self.gpu_flops = gpu_flops
+        self.pcie_bandwidth = pcie_bandwidth
+        self._min_mamba_admit_depth = compute_min_mamba_admit_depth(
+            model, gpu_flops, pcie_bandwidth
+        )
 
     # ------------------------------------------------------------------
     # Admission (identical to MarconiStrategy)
     # ------------------------------------------------------------------
 
-    def admit_mamba_state(self, node: RadixNode) -> bool:
-        """Admit Mamba state only at turn-end nodes (last token of a request)."""
-        return node.is_turn_end
+    def plan_request(
+        self,
+        tree: RadixTree,
+        matched_nodes: List[RadixNode],
+        remaining_pages: List[PageKey],
+    ) -> RequestPlan:
+        """Admit every remaining page; place mamba at turn-end + fork-
+        point parent when their depths clear the PCIe break-even threshold."""
+        if not remaining_pages:
+            return RequestPlan(remaining=[])
 
-    def on_new_nodes_inserted(
+        statuses: List[PageStatus] = [PageStatus.KV_ONLY] * len(remaining_pages)
+        fork_point = False
+
+        if tree.mamba_state_token_equiv == 0:
+            return RequestPlan(remaining=statuses)
+
+        parent = matched_nodes[-1] if matched_nodes else tree.root
+        parent_depth = parent.depth_tokens
+        end_depth = parent_depth + sum(len(p) for p in remaining_pages)
+        threshold = self._min_mamba_admit_depth
+
+        if threshold == 0 or end_depth >= threshold:
+            statuses[-1] = PageStatus.KV_AND_MAMBA
+
+        if (
+            parent is not tree.root
+            and len(parent.children) >= 1
+            and not parent.has_mamba_state
+            and (threshold == 0 or parent_depth >= threshold)
+        ):
+            fork_point = True
+
+        return RequestPlan(
+            remaining=statuses, mamba_on_matched_parent=fork_point
+        )
+
+    def on_nodes_inserted(
         self, tree: RadixTree, new_nodes: List[RadixNode]
     ) -> None:
-        """Initialise per-node LRU clock and admit fork-point mamba state."""
+        """Initialise the per-node ``_branch_lru`` timestamp."""
         if not new_nodes:
             return
         ts = tree.clock
         for n in new_nodes:
             n._branch_lru = ts  # type: ignore[attr-defined]
-
-        parent = new_nodes[0].parent
-        if parent is None or parent is tree.root:
-            return
-        if len(parent.children) > 1 and not parent.has_mamba_state:
-            tree.set_mamba_state(parent)
 
     # ------------------------------------------------------------------
     # Touch policy

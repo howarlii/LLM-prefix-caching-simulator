@@ -11,19 +11,16 @@ from typing import Any, Dict, List, Optional, cast
 
 from tqdm import tqdm
 
-from src.cache_simulator import KVCacheSimulator, MultiTierCacheSimulator
+from src.cache_simulator import KVCacheSimulator
 from src.config import (
+    DEFAULT_GPU_FLOPS,
+    DEFAULT_PCIE_BANDWIDTH,
     DEFAULT_TOKENIZER_NAME,
     gb_to_token_capacity,
     ensure_hf_cache_dirs,
 )
 from src.datasets_loader import is_mooncake_trace_dataset, load_raw_requests
-from src.metrics import (
-    MultiTierRunMetrics,
-    RunMetrics,
-    compute_multi_tier_run_metrics,
-    compute_run_metrics,
-)
+from src.metrics import RunMetrics, compute_run_metrics
 from src.model_config import DEFAULT_MODEL, ModelConfig
 from src.request_generator import (
     OrderingName,
@@ -31,7 +28,7 @@ from src.request_generator import (
     load_or_tokenize,
     order_requests,
 )
-from src.strategies import BranchStrategy, CRFDecouplingStrategy, FIFOStrategy, LFUStrategy, LRUStrategy, MarconiStrategy, Marconi2Strategy, Marconi3Strategy, EvictionStrategy
+from src.strategies import BranchStrategy, CRFDecouplingStrategy, FIFOStrategy, LRUStrategy, MarconiStrategy, Marconi2Strategy, Marconi3Strategy, OracleGreedyStrategy, EvictionStrategy
 
 
 def effective_page_size(dataset: str, page_size: int) -> int:
@@ -41,18 +38,48 @@ def effective_page_size(dataset: str, page_size: int) -> int:
     return page_size
 
 
-def strategy_from_name(name: str, model: ModelConfig = DEFAULT_MODEL) -> EvictionStrategy:
+def strategy_from_name(
+    name: str,
+    model: ModelConfig = DEFAULT_MODEL,
+    *,
+    gpu_flops: Optional[float] = None,
+    pcie_bandwidth: Optional[float] = None,
+    requests: Optional[List["TokenizedRequest"]] = None,
+    page_size: Optional[int] = None,
+) -> EvictionStrategy:
     n = name.lower()
+    # Oracle strategies need the full request sequence at construction
+    # time.  ``requests`` and ``page_size`` are required for these names;
+    # they are ignored by every other strategy.
+    if n == "oracle_greedy" or n.startswith("oracle_greedy"):
+        if requests is None or page_size is None:
+            raise ValueError(
+                "oracle_greedy strategy requires `requests` and `page_size` kwargs"
+            )
+        return OracleGreedyStrategy(
+            requests_token_ids=[r.token_ids for r in requests],
+            page_size=page_size,
+            model=model,
+            gpu_flops=gpu_flops,
+            pcie_bandwidth=pcie_bandwidth,
+        )
+    # Hardware-aware kwargs for the "new" strategies (branch + marconi3) that
+    # need gpu_flops/pcie_bandwidth to compute the mamba-state admit-depth
+    # threshold.  Pure-LRU/LFU/FIFO/older-marconi don't accept them.
+    hw_kwargs: dict = {}
+    if gpu_flops is not None:
+        hw_kwargs["gpu_flops"] = gpu_flops
+    if pcie_bandwidth is not None:
+        hw_kwargs["pcie_bandwidth"] = pcie_bandwidth
+
     if n == "lru":
         return LRUStrategy()
-    if n == "lfu":
-        return LFUStrategy()
     if n == "fifo":
         return FIFOStrategy()
     if n == "branch":
-        return BranchStrategy()
+        return BranchStrategy(model=model, **hw_kwargs)
     if n == "branch_nt":
-        return BranchStrategy(newtouch=True)
+        return BranchStrategy(newtouch=True, model=model, **hw_kwargs)
     if n == "marconi" or n.startswith("marconi_"):
         # Optional alpha suffix: "marconi_a2.0" → alpha=2.0
         m = re.search(r"_a([\d.]+)", n)
@@ -89,12 +116,13 @@ def strategy_from_name(name: str, model: ModelConfig = DEFAULT_MODEL) -> Evictio
             use_mid_chain_checkpoint=use_mn,
             newtouch=newtouch,
             model=model,
+            **hw_kwargs,
             **kwargs,
         )
     if n == "marconi3" or n.startswith("marconi3_"):
         m = re.search(r"_a([\d.]+)", n)
         kwargs = {"alpha": float(m.group(1))} if m else {}
-        return Marconi3Strategy(model=model, **kwargs)
+        return Marconi3Strategy(model=model, **hw_kwargs, **kwargs)
     if n == "crf_decoupling" or n.startswith("crf_decoupling_"):
         # Optional lambda suffix: "crf_decoupling_0.01" → lambda_decay=0.01
         parts = n.split("_", 2)
@@ -104,6 +132,12 @@ def strategy_from_name(name: str, model: ModelConfig = DEFAULT_MODEL) -> Evictio
 
 
 def capacity_from_spec(spec: str, kv_bytes_per_token: int | None = None, *, model: ModelConfig | None = None) -> Optional[int]:
+    """Convert a capacity spec string to token count.
+
+    ``"inf"`` / ``"none"`` / ``"unlimited"`` → ``None`` (unlimited).
+    ``"0"`` → ``0`` (used to signal "DRAM tier disabled").
+    Otherwise interpreted as gigabytes.
+    """
     s = spec.strip().lower()
     if s in ("inf", "none", "unlimited"):
         return None
@@ -120,76 +154,95 @@ def run_simulation(
     page_size: int,
     strategy: EvictionStrategy,
     capacity_tokens: Optional[int],
+    *,
+    dram_strategy: Optional[EvictionStrategy] = None,
+    dram_capacity_tokens: Optional[int] = 0,
     logger: object = None,
     model: Optional[ModelConfig] = None,
+    gpu_flops: float = DEFAULT_GPU_FLOPS,
+    pcie_bandwidth: float = DEFAULT_PCIE_BANDWIDTH,
 ) -> RunMetrics:
-    mamba = model.mamba_state_token_equiv if model is not None else 0
+    """Run a single-tier or two-tier simulation.
+
+    DRAM tier is enabled iff ``dram_strategy`` is not None and
+    ``dram_capacity_tokens != 0``.  ``dram_capacity_tokens=None`` means
+    unlimited DRAM (no eviction); a positive int caps the tier; ``0``
+    disables DRAM.
+
+    ``gpu_flops`` (FLOP/sec) and ``pcie_bandwidth`` (bytes/sec) parameterise
+    the wall-clock cost model used by ``compute_run_metrics``.
+    """
     sim = KVCacheSimulator(
         page_size=page_size,
         strategy=strategy,
         capacity_tokens=capacity_tokens,
-        mamba_state_token_equiv=mamba,
-        logger=logger,
-    )
-    for req in tqdm(requests, desc="Simulating", leave=False, disable=not sys.stderr.isatty()):
-        sim.process_token_ids(req.token_ids)
-    return compute_run_metrics(sim.state, sim.tree, model=model)
-
-
-def run_multi_tier_simulation(
-    requests: List[TokenizedRequest],
-    page_size: int,
-    hbm_strategy: EvictionStrategy,
-    dram_strategy: EvictionStrategy,
-    hbm_capacity_tokens: int,
-    dram_capacity_tokens: int,
-    model: Optional[ModelConfig] = None,
-) -> MultiTierRunMetrics:
-    """Run a two-tier (HBM + DRAM) cache simulation."""
-    mamba = model.mamba_state_token_equiv if model is not None else 0
-    sim = MultiTierCacheSimulator(
-        page_size=page_size,
-        hbm_strategy=hbm_strategy,
         dram_strategy=dram_strategy,
-        hbm_capacity_tokens=hbm_capacity_tokens,
         dram_capacity_tokens=dram_capacity_tokens,
-        mamba_state_token_equiv=mamba,
+        model=model,
+        logger=logger,
+        gpu_flops=gpu_flops,
+        pcie_bandwidth=pcie_bandwidth,
     )
-    for req in tqdm(requests, desc="Simulating (multi-tier)", leave=False, disable=not sys.stderr.isatty()):
+    desc = "Simulating" + (" (HBM+DRAM)" if sim.dram_enabled else "")
+    for req in tqdm(requests, desc=desc, leave=False, disable=not sys.stderr.isatty()):
         sim.process_token_ids(req.token_ids)
-    return compute_multi_tier_run_metrics(
-        sim.state, sim.hbm_tree, sim.dram_tree, model=model
+    return compute_run_metrics(
+        sim.state,
+        sim.tree,
+        model=model,
+        dram_tree=sim.dram_tree,
+        gpu_flops=gpu_flops,
+        pcie_bandwidth=pcie_bandwidth,
     )
 
 
 RESULT_CSV_FIELDS: List[str] = [
+    # ── Run identity ────────────────────────────────────────────────────
     "dataset",
     "page_size",
     "ordering",
     "strategy",
     "capacity_spec",
+    "dram_strategy",
+    "dram_capacity_spec",
     "tokenizer",
-    "mamba_state_token_equiv",
+    "model_name",
+    "gpu_flops",
+    "pcie_bandwidth",
     "num_requests",
-    "page_level_hit_rate",
-    "token_level_hit_rate",
-    "turn_level_hit_rate",
-    "per_request_hit_rate_mean",
-    "per_request_hit_rate_p50",
-    "per_request_hit_rate_p90",
-    "per_request_hit_rate_p99",
+    "total_input_tokens",
+    # ── Tier hit rates ──────────────────────────────────────────────────
+    "hbm_token_hit_rate",
+    "dram_token_hit_rate",
+    # ── Token / capacity summary ────────────────────────────────────────
     "load_tokens",
     "compute_tokens",
     "load_compute_ratio",
     "peak_cached_tokens",
     "avg_cached_tokens",
-    "total_input_tokens",
+    "dram_peak_cached_tokens",
+    "dram_avg_cached_tokens",
+    "avg_promoted_tokens_per_req",
+    "avg_demoted_tokens_per_req",
+    # ── Branch statistics ───────────────────────────────────────────────
     "req_branch_rate",
     "req_new_branch_rate",
-    "flops_save_rate",
-    "total_flops_no_cache",
-    "total_flops_with_cache",
-    "model_name",
+    # ── FLOP counts and savings ─────────────────────────────────────────
+    "total_flop_no_cache",
+    "total_flop_with_cache",
+    "flop_save_rate",
+    # ── Wall-clock time (seconds), GPU + PCIe ───────────────────────────
+    "gpu_compute_time_no_cache",
+    "gpu_compute_time_with_cache",
+    "pcie_total_transfer_bytes",
+    "pcie_total_transfer_time",
+    "total_saved_time",
+    "saved_time_rate",
+    # ── Per-request saved-time distribution ─────────────────────────────
+    "per_request_saved_time_mean",
+    "per_request_saved_time_p50",
+    "per_request_saved_time_p90",
+    "per_request_saved_time_p99",
 ]
 
 
@@ -201,10 +254,19 @@ def persist_result_row(
     out_json_dir.mkdir(parents=True, exist_ok=True)
     out_csv.parent.mkdir(parents=True, exist_ok=True)
 
-    slug = (
-        f"{row.get('dataset')}_ps{row.get('page_size')}_"
-        f"{row.get('ordering')}_{row.get('strategy')}_cap{row.get('capacity_spec')}"
-    )
+    dram_strategy = row.get("dram_strategy") or ""
+    dram_cap_spec = row.get("dram_capacity_spec") or ""
+
+    slug_parts = [
+        f"{row.get('dataset')}",
+        f"ps{row.get('page_size')}",
+        f"{row.get('ordering')}",
+        f"{row.get('strategy')}",
+        f"cap{row.get('capacity_spec')}",
+    ]
+    if dram_strategy:
+        slug_parts.append(f"dram-{dram_strategy}-{dram_cap_spec}")
+    slug = "_".join(slug_parts)
     jpath = out_json_dir / f"{slug}.json"
     jpath.write_text(json.dumps(row, indent=2, ensure_ascii=False), encoding="utf-8")
 
@@ -215,31 +277,33 @@ def persist_result_row(
         "ordering": row.get("ordering"),
         "strategy": row.get("strategy"),
         "capacity_spec": row.get("capacity_spec"),
+        "dram_strategy": dram_strategy,
+        "dram_capacity_spec": dram_cap_spec,
         "tokenizer": row.get("tokenizer"),
-        "mamba_state_token_equiv": row.get("mamba_state_token_equiv", 0),
-        "num_requests": metrics.get("num_requests"),
-        "page_level_hit_rate": metrics.get("page_level_hit_rate"),
-        "token_level_hit_rate": metrics.get("token_level_hit_rate"),
-        "turn_level_hit_rate": metrics.get("turn_level_hit_rate"),
-        "per_request_hit_rate_mean": metrics.get("per_request_hit_rate_mean"),
-        "per_request_hit_rate_p50": metrics.get("per_request_hit_rate_p50"),
-        "per_request_hit_rate_p90": metrics.get("per_request_hit_rate_p90"),
-        "per_request_hit_rate_p99": metrics.get("per_request_hit_rate_p99"),
-        "load_tokens": metrics.get("load_tokens"),
-        "compute_tokens": metrics.get("compute_tokens"),
-        "load_compute_ratio": metrics.get("load_compute_ratio"),
-        "peak_cached_tokens": metrics.get("peak_cached_tokens"),
-        "avg_cached_tokens": metrics.get("avg_cached_tokens"),
-        "total_input_tokens": metrics.get("total_input_tokens"),
-        "req_branch_rate": metrics.get("req_branch_rate"),
-        "req_new_branch_rate": metrics.get("req_new_branch_rate"),
-        "flops_save_rate": metrics.get("flops_save_rate"),
-        "total_flops_no_cache": metrics.get("total_flops_no_cache"),
-        "total_flops_with_cache": metrics.get("total_flops_with_cache"),
         "model_name": row.get("model_name", ""),
+        "gpu_flops": row.get("gpu_flops", ""),
+        "pcie_bandwidth": row.get("pcie_bandwidth", ""),
     }
+    # Pull every metric named in RESULT_CSV_FIELDS straight from the dict.
+    for field in RESULT_CSV_FIELDS:
+        if field in flat:
+            continue
+        flat[field] = metrics.get(field)
 
-    KEY_FIELDS = ("dataset", "page_size", "ordering", "strategy", "capacity_spec", "num_req")
+    KEY_FIELDS = (
+        "dataset",
+        "page_size",
+        "ordering",
+        "num_requests",
+        "strategy",
+        "capacity_spec",
+        "dram_strategy",
+        "dram_capacity_spec",
+        "model_name",
+        "gpu_flops",
+        "pcie_bandwidth",
+        "gpu_flops",
+    )
 
     new_row = {k: flat.get(k, "") for k in RESULT_CSV_FIELDS}
     key = tuple(str(new_row.get(k, "")) for k in KEY_FIELDS)

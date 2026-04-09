@@ -24,7 +24,7 @@ The candidate with the **lowest** score is evicted.
 * ``flop_efficiency(n)`` – incremental FLOPs saved (relative to parent)
   divided by total memory cost of the path, normalised to [0, 1].
   Matches the original ``radix_cache_hybrid.evict_v2`` formula including
-  the MLP bug (uses ``get_attn_flops`` instead of ``get_mlp_flops`` for
+  the MLP bug (uses ``get_attn_flop`` instead of ``get_mlp_flop`` for
   the parent subtraction term).
 
 Candidate operations:
@@ -41,14 +41,19 @@ from typing import List, Optional, Tuple
 from src.model_config import (
     DEFAULT_MODEL,
     ModelConfig,
-    _attn_flops,
+    _attn_flop,
     _kvs_size,
-    _mamba1_flops,
+    _mamba1_flop,
     _mamba_state_size,
-    _mlp_flops,
+    _mlp_flop,
 )
-from src.radix_tree import RadixNode, RadixTree
-from src.strategies.base import EvictOp, EvictionStrategy
+from src.radix_tree import PageKey, RadixNode, RadixTree
+from src.strategies.base import (
+    EvictOp,
+    EvictionStrategy,
+    PageStatus,
+    RequestPlan,
+)
 
 
 def _normalize(values: List[float], default: float = 1.0) -> List[float]:
@@ -87,35 +92,51 @@ class MarconiStrategy(EvictionStrategy):
         self.d = model.d_model
         self.n = model.ssm_state_dim
 
-    @property
-    def drop_partial_last_page(self) -> bool:
-        return True
-
     # ------------------------------------------------------------------
     # Admission
     # ------------------------------------------------------------------
 
-    def admit_mamba_state(self, node: RadixNode) -> bool:
-        """Admit Mamba state only at turn-end nodes (last token of a request)."""
-        return node.is_turn_end
+    def plan_request(
+        self,
+        tree: RadixTree,
+        matched_nodes: List[RadixNode],
+        remaining_pages: List[PageKey],
+    ) -> RequestPlan:
+        """Admit every remaining page.  In hybrid mode, put mamba state
+        at the turn-end page and (if this insertion creates a branching
+        point) on the deepest matched node (the fork-point parent)."""
+        if not remaining_pages:
+            return RequestPlan(remaining=[])
 
-    def on_new_nodes_inserted(
-        self, tree: RadixTree, new_nodes: List[RadixNode]
-    ) -> None:
-        """Admit Mamba state at fork-point parents created by this insertion."""
-        if not new_nodes:
-            return
-        parent = new_nodes[0].parent
-        if parent is None or parent is tree.root:
-            return
-        if len(parent.children) > 1 and not parent.has_mamba_state:
-            tree.set_mamba_state(parent)
+        default_status = PageStatus.KV_ONLY
+        statuses = [default_status] * len(remaining_pages)
+        fork_point = False
+
+        if tree.mamba_state_token_equiv > 0:
+            # Turn-end mamba.
+            statuses[-1] = PageStatus.KV_AND_MAMBA
+
+            # Fork-point parent: if the deepest matched node already has
+            # at least one child, this new insertion turns it into a
+            # branching point.
+            if matched_nodes:
+                parent = matched_nodes[-1]
+                if (
+                    parent is not tree.root
+                    and len(parent.children) >= 1
+                    and not parent.has_mamba_state
+                ):
+                    fork_point = True
+
+        return RequestPlan(
+            remaining=statuses, mamba_on_matched_parent=fork_point
+        )
 
     # ------------------------------------------------------------------
     # FLOP efficiency per node (original Marconi formula)
     # ------------------------------------------------------------------
 
-    def _node_flops_efficiency_fast(
+    def _node_flop_efficiency_fast(
         self, seqlen_total: int, seqlen_parent: int
     ) -> float:
         """FLOP efficiency with precomputed depth values (no tree walk)."""
@@ -123,11 +144,11 @@ class MarconiStrategy(EvictionStrategy):
 
         d, n = self.d, self.n
 
-        flops_mamba = self.num_ssm_layers * _mamba1_flops(seqlen_child, d, n)
-        flops_attn = self.num_attn_layers * (_attn_flops(seqlen_total, d) - _attn_flops(seqlen_parent, d))
-        # Original bug: mlp parent term uses _attn_flops instead of _mlp_flops
-        flops_mlp = self.num_mlp_layers * (_mlp_flops(seqlen_total, d) - _attn_flops(seqlen_parent, d))
-        total_flops_savings = flops_mamba + flops_attn + flops_mlp
+        flop_mamba = self.num_ssm_layers * _mamba1_flop(seqlen_child, d, n)
+        flop_attn = self.num_attn_layers * (_attn_flop(seqlen_total, d) - _attn_flop(seqlen_parent, d))
+        # Original bug: mlp parent term uses _attn_flop instead of _mlp_flop
+        flop_mlp = self.num_mlp_layers * (_mlp_flop(seqlen_total, d) - _attn_flop(seqlen_parent, d))
+        total_flop_savings = flop_mamba + flop_attn + flop_mlp
 
         total_memory = (
             self.num_ssm_layers * _mamba_state_size(d, n)
@@ -135,7 +156,7 @@ class MarconiStrategy(EvictionStrategy):
         )
         if total_memory == 0:
             return 0.0
-        return total_flops_savings / total_memory
+        return total_flop_savings / total_memory
 
     # ------------------------------------------------------------------
     # Unified eviction
@@ -154,28 +175,26 @@ class MarconiStrategy(EvictionStrategy):
         """
         current_ts = tree.clock
 
-        # Top-down BFS: compute depth_tokens and checkpoint_depth as we go.
-        # Each queue entry: (node, depth_tokens, checkpoint_depth)
-        # checkpoint_depth = depth_tokens of nearest ancestor with mamba state (0 = root)
+        # Top-down BFS: depth_tokens is precomputed on each node; we only
+        # need to track checkpoint_depth (nearest ancestor with mamba state).
         candidates: List[Tuple[RadixNode, EvictOp, int, int]] = []
-        q: deque[Tuple[RadixNode, int, int]] = deque()
+        q: deque[Tuple[RadixNode, int]] = deque()
         for child in tree.root.children.values():
-            q.append((child, child.num_tokens, 0))
+            q.append((child, 0))
 
         while q:
-            node, depth_tokens, checkpoint_depth = q.popleft()
+            node, checkpoint_depth = q.popleft()
 
-            # Checkpoint depth for *children* of this node
-            child_checkpoint = depth_tokens if node.has_mamba_state else checkpoint_depth
+            child_checkpoint = node.depth_tokens if node.has_mamba_state else checkpoint_depth
 
             num_ch = len(node.children)
             if num_ch == 0:
-                candidates.append((node, "leaf", depth_tokens, checkpoint_depth))
+                candidates.append((node, "leaf", node.depth_tokens, checkpoint_depth))
             elif node.has_mamba_state:
-                candidates.append((node, "mamba", depth_tokens, checkpoint_depth))
+                candidates.append((node, "mamba", node.depth_tokens, checkpoint_depth))
 
             for ch in node.children.values():
-                q.append((ch, depth_tokens + ch.num_tokens, child_checkpoint))
+                q.append((ch, child_checkpoint))
 
         if not candidates:
             return []
@@ -188,7 +207,7 @@ class MarconiStrategy(EvictionStrategy):
 
         # --- FLOP efficiency with precomputed depths (no parent walk) ---
         flop_eff_values = [
-            self._node_flops_efficiency_fast(dt, cp)
+            self._node_flop_efficiency_fast(dt, cp)
             for _, _, dt, cp in candidates
         ]
 

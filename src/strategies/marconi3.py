@@ -10,7 +10,7 @@ Built on top of Marconi (v1) with two additions:
 
    - ``ev0`` (default): Original Marconi scoring.
      ``score = alpha * norm_flop_eff + norm_recency``
-     where ``flop_eff = total_flops_savings / total_memory`` and
+     where ``flop_eff = total_flop_savings / total_memory`` and
      ``recency = 1 / (current_ts - last_access)``, both min-max normalised.
 
    - ``ev1``: Uses the same FLOP formulas for depth computation, but scores
@@ -22,7 +22,7 @@ Built on top of Marconi (v1) with two additions:
 
    - ``ev2``: Uses raw FLOP savings (not divided by memory), normalised,
      then divided by freed capacity:
-     ``score = (norm_r + alpha * norm_flops) / freed``
+     ``score = (norm_r + alpha * norm_flop) / freed``
 """
 
 from __future__ import annotations
@@ -30,16 +30,22 @@ from __future__ import annotations
 from collections import deque
 from typing import List, Optional, Tuple
 
-from src.radix_tree import RadixNode, RadixTree
-from src.strategies.base import EvictOp, EvictionStrategy
+from src.radix_tree import PageKey, RadixNode, RadixTree
+from src.strategies.base import (
+    EvictOp,
+    EvictionStrategy,
+    PageStatus,
+    RequestPlan,
+    compute_min_mamba_admit_depth,
+)
 from src.model_config import (
     DEFAULT_MODEL,
     ModelConfig,
-    _attn_flops,
+    _attn_flop,
     _kvs_size,
-    _mamba1_flops,
+    _mamba1_flop,
     _mamba_state_size,
-    _mlp_flops,
+    _mlp_flop,
 )
 from src.strategies.marconi import _normalize
 
@@ -55,20 +61,6 @@ def _effective_ts(node: RadixNode) -> int:
     scoring behaviour.
     """
     return getattr(node, "_m3_lru", node.last_access)
-
-
-def _estimate_leaf_free(leaf: RadixNode) -> int:
-    """Estimate tokens freed by removing a leaf and pruning its empty chain."""
-    total = leaf.num_tokens
-    cur = leaf.parent
-    while cur is not None and cur.parent is not None:
-        if len(cur.children) > 1:
-            break
-        if cur.has_mamba_state:
-            break
-        total += cur.num_tokens
-        cur = cur.parent
-    return total
 
 
 class Marconi3Strategy(EvictionStrategy):
@@ -118,6 +110,8 @@ class Marconi3Strategy(EvictionStrategy):
         use_mid_chain_checkpoint: bool = False,
         newtouch: bool = False,
         model: ModelConfig = DEFAULT_MODEL,
+        gpu_flops: Optional[float] = None,
+        pcie_bandwidth: Optional[float] = None,
     ) -> None:
         self.alpha = alpha
         self.evict_mode = evict_mode
@@ -129,18 +123,95 @@ class Marconi3Strategy(EvictionStrategy):
         self.num_mlp_layers = model.num_mlp_layers
         self.d = model.d_model
         self.n = model.ssm_state_dim
-
-    @property
-    def drop_partial_last_page(self) -> bool:
-        return True
+        self.gpu_flops = gpu_flops
+        self.pcie_bandwidth = pcie_bandwidth
+        # Hardware-aware mamba-state admit depth: nodes shallower than this
+        # are not worth a Mamba state because loading the state via PCIe
+        # would cost more than just recomputing the prefix from scratch.
+        self._min_mamba_admit_depth = compute_min_mamba_admit_depth(
+            model, gpu_flops, pcie_bandwidth
+        )
 
     # ------------------------------------------------------------------
     # Admission
     # ------------------------------------------------------------------
 
-    def admit_mamba_state(self, node: RadixNode) -> bool:
-        """Admit Mamba state only at turn-end nodes (last token of a request)."""
-        return node.is_turn_end
+    def plan_request(
+        self,
+        tree: RadixTree,
+        matched_nodes: List[RadixNode],
+        remaining_pages: List[PageKey],
+    ) -> RequestPlan:
+        """Admit every remaining page; place mamba at turn-end (if deep
+        enough), fork-point parent, and optionally a mid-chain checkpoint."""
+        if not remaining_pages:
+            return RequestPlan(remaining=[])
+
+        statuses: List[PageStatus] = [PageStatus.KV_ONLY] * len(remaining_pages)
+        fork_point = False
+
+        if tree.mamba_state_token_equiv == 0:
+            return RequestPlan(remaining=statuses)
+
+        parent = matched_nodes[-1] if matched_nodes else tree.root
+        parent_depth = parent.depth_tokens
+        chain_tokens = sum(len(p) for p in remaining_pages)
+        end_depth = parent_depth + chain_tokens
+        threshold = self._min_mamba_admit_depth
+
+        # --- Turn-end mamba ---
+        if threshold == 0 or end_depth >= threshold:
+            statuses[-1] = PageStatus.KV_AND_MAMBA
+
+        # --- Fork-point parent ---
+        if (
+            parent is not tree.root
+            and len(parent.children) >= 1
+            and not parent.has_mamba_state
+            and (threshold == 0 or parent_depth >= threshold)
+        ):
+            fork_point = True
+
+        # --- Mid-chain checkpoint at ~55% of (last_checkpoint → end) ---
+        if not self.use_mid_chain_checkpoint:
+            return RequestPlan(
+                remaining=statuses, mamba_on_matched_parent=fork_point
+            )
+
+        last_checkpoint_depth = 0
+        for n in reversed(matched_nodes):
+            if n.has_mamba_state:
+                last_checkpoint_depth = n.depth_tokens
+                break
+
+        total_span = end_depth - last_checkpoint_depth
+        if total_span < _MIN_CHAIN_TOKENS_FOR_MID_CHECKPOINT:
+            return RequestPlan(
+                remaining=statuses, mamba_on_matched_parent=fork_point
+            )
+
+        target_depth = last_checkpoint_depth + int(total_span * 0.55)
+        if (
+            target_depth > parent_depth
+            and target_depth < end_depth
+            and (threshold == 0 or target_depth >= threshold)
+        ):
+            offset = target_depth - parent_depth
+            cum = 0
+            for i, p in enumerate(remaining_pages):
+                cum += len(p)
+                if cum >= offset:
+                    if statuses[i] != PageStatus.KV_AND_MAMBA:
+                        statuses[i] = PageStatus.KV_AND_MAMBA
+                    break
+
+        return RequestPlan(
+            remaining=statuses, mamba_on_matched_parent=fork_point
+        )
+
+    # ------------------------------------------------------------------
+    # Bookkeeping (newtouch LRU + selective ancestor refresh)
+    # ------------------------------------------------------------------
 
     def on_cache_hit(
         self, tree: RadixTree, matched_nodes: List[RadixNode]
@@ -155,133 +226,50 @@ class Marconi3Strategy(EvictionStrategy):
             return
         ts = tree.clock
 
-        # Deepest matched node is always refreshed.
         last = matched_nodes[-1]
         last._m3_lru = ts  # type: ignore[attr-defined]
 
-        # Walk from the deepest matched upward.  ``cur_cp`` is the
-        # deepest mamba-state node already visited in this walk —
-        # i.e. the "previous checkpoint" for the next ancestor we
-        # look at.
         cur_cp: Optional[RadixNode] = last if last.has_mamba_state else None
         for i in range(len(matched_nodes) - 2, -1, -1):
             n = matched_nodes[i]
-            if cur_cp is not None:
-                num_ch = len(cur_cp.children)
-                if num_ch > 1:
-                    # previous checkpoint is a branch point → refresh n
-                    n._m3_lru = ts  # type: ignore[attr-defined]
-                # num_ch == 0 (leaf) or num_ch == 1 (single-child): skip.
+            if cur_cp is not None and len(cur_cp.children) > 1:
+                # previous checkpoint is a branch point → refresh n
+                n._m3_lru = ts  # type: ignore[attr-defined]
             if n.has_mamba_state:
                 cur_cp = n
 
-    def on_new_nodes_inserted(
+    def on_nodes_inserted(
         self, tree: RadixTree, new_nodes: List[RadixNode]
     ) -> None:
-        """Handle fork-point parent admission + mid-chain checkpoint placement."""
-        if not new_nodes:
+        """Initialise the per-node ``_m3_lru`` timestamp on new nodes."""
+        if not self.newtouch or not new_nodes:
             return
-
-        if self.newtouch:
-            ts = tree.clock
-            for n in new_nodes:
-                n._m3_lru = ts  # type: ignore[attr-defined]
-
-        # --- Fork-point parent ---
-        parent = new_nodes[0].parent
-        if parent is not None and parent is not tree.root:
-            if len(parent.children) > 1 and not parent.has_mamba_state:
-                tree.set_mamba_state(parent)
-
-        # --- Mid-chain checkpoint at ~55% ---
-        if not self.use_mid_chain_checkpoint:
-            return
-
-        anchor = new_nodes[0].parent
-        tokens_before_chain = 0
-        cur = anchor
-        while cur is not None and cur.parent is not None:
-            if cur.has_mamba_state:
-                break
-            tokens_before_chain += cur.num_tokens
-            cur = cur.parent
-
-        chain_tokens = sum(n.num_tokens for n in new_nodes)
-        total_span = tokens_before_chain + chain_tokens
-
-        if total_span < _MIN_CHAIN_TOKENS_FOR_MID_CHECKPOINT:
-            return
-
-        target_pos = int(total_span * 0.55)
-
-        if target_pos <= tokens_before_chain:
-            remaining = tokens_before_chain - target_pos
-            candidate = anchor
-            while candidate is not None and candidate.parent is not None:
-                if candidate.has_mamba_state:
-                    break
-                if remaining <= 0:
-                    break
-                remaining -= candidate.num_tokens
-                if remaining <= 0:
-                    break
-                candidate = candidate.parent
-            if candidate is not None and candidate is not tree.root and not candidate.has_mamba_state:
-                if candidate.num_pages > 1:
-                    offset_in_node = candidate.num_tokens + remaining
-                    pages_to_keep = 0
-                    cum = 0
-                    for p in candidate.pages:
-                        cum += len(p)
-                        pages_to_keep += 1
-                        if cum >= offset_in_node:
-                            break
-                    if 0 < pages_to_keep < candidate.num_pages:
-                        tree.split_node(candidate, pages_to_keep)
-                tree.set_mamba_state(candidate)
-        else:
-            offset_in_chain = target_pos - tokens_before_chain
-            cumulative = 0
-            for node in new_nodes:
-                if cumulative + node.num_tokens >= offset_in_chain:
-                    offset_in_node = offset_in_chain - cumulative
-                    if offset_in_node > 0 and node.num_pages > 1:
-                        pages_to_keep = 0
-                        cum = 0
-                        for p in node.pages:
-                            cum += len(p)
-                            pages_to_keep += 1
-                            if cum >= offset_in_node:
-                                break
-                        if 0 < pages_to_keep < node.num_pages:
-                            tree.split_node(node, pages_to_keep)
-                    if not node.has_mamba_state:
-                        tree.set_mamba_state(node)
-                    break
-                cumulative += node.num_tokens
+        ts = tree.clock
+        for n in new_nodes:
+            n._m3_lru = ts  # type: ignore[attr-defined]
 
     # ------------------------------------------------------------------
     # FLOP / memory helpers
     # ------------------------------------------------------------------
 
-    def _prefill_flops(self, seqlen: int) -> float:
-        """Total prefill FLOPs from position 0 to *seqlen*.
+    def _prefill_flop(self, seqlen: int) -> float:
+        """Total prefill FLOP count from position 0 to *seqlen*.
 
         Accounts for the O(L^2) nature of attention.
         """
         d, n = self.d, self.n
         return (
-            self.num_ssm_layers * _mamba1_flops(seqlen, d, n)
-            + self.num_attn_layers * _attn_flops(seqlen, d)
-            + self.num_mlp_layers * _mlp_flops(seqlen, d)
+            self.num_ssm_layers * _mamba1_flop(seqlen, d, n)
+            + self.num_attn_layers * _attn_flop(seqlen, d)
+            + self.num_mlp_layers * _mlp_flop(seqlen, d)
         )
 
-    def _node_flops_savings(self, depth_tokens: int, checkpoint_depth: int) -> float:
-        """FLOPs saved by caching from *checkpoint_depth* to *depth_tokens*.
+    def _node_flop_savings(self, depth_tokens: int, checkpoint_depth: int) -> float:
+        """FLOP count saved by caching from *checkpoint_depth* to *depth_tokens*.
 
-        Equal to prefill_flops(depth_tokens) - prefill_flops(checkpoint_depth).
+        Equal to prefill_flop(depth_tokens) - prefill_flop(checkpoint_depth).
         """
-        return self._prefill_flops(depth_tokens) - self._prefill_flops(checkpoint_depth)
+        return self._prefill_flop(depth_tokens) - self._prefill_flop(checkpoint_depth)
 
     def _mamba_memory_occupy(self) -> float:
         d, n = self.d, self.n
@@ -311,25 +299,26 @@ class Marconi3Strategy(EvictionStrategy):
         """
         current_ts = tree.clock
 
-        # Top-down BFS to compute depth_tokens and checkpoint_depth.
+        # Top-down BFS: depth_tokens is precomputed on each node; only
+        # checkpoint_depth (nearest mamba ancestor) needs tracking.
         candidates: List[Tuple[RadixNode, EvictOp, int, int]] = []
-        q: deque[Tuple[RadixNode, int, int]] = deque()
+        q: deque[Tuple[RadixNode, int]] = deque()
         for child in tree.root.children.values():
-            q.append((child, child.num_tokens, 0))
+            q.append((child, 0))
 
         while q:
-            node, depth_tokens, checkpoint_depth = q.popleft()
+            node, checkpoint_depth = q.popleft()
 
-            child_checkpoint = depth_tokens if node.has_mamba_state else checkpoint_depth
+            child_checkpoint = node.depth_tokens if node.has_mamba_state else checkpoint_depth
 
             num_ch = len(node.children)
             if num_ch == 0:
-                candidates.append((node, "leaf", depth_tokens, checkpoint_depth))
+                candidates.append((node, "leaf", node.depth_tokens, checkpoint_depth))
             elif node.has_mamba_state:
-                candidates.append((node, "mamba", depth_tokens, checkpoint_depth))
+                candidates.append((node, "mamba", node.depth_tokens, checkpoint_depth))
 
             for ch in node.children.values():
-                q.append((ch, depth_tokens + ch.num_tokens, child_checkpoint))
+                q.append((ch, child_checkpoint))
 
         if not candidates:
             return []
@@ -350,7 +339,7 @@ class Marconi3Strategy(EvictionStrategy):
     ) -> List[Tuple[float, RadixNode, EvictOp]]:
         """Original Marconi scoring: alpha * norm_flop_eff + norm_recency.
 
-        flop_eff = flops_savings / memory_occupy per node.
+        flop_eff = flop_savings / memory_occupy per node.
         """
         recency_values = [
             1.0 / max(current_ts - _effective_ts(n), 1)
@@ -359,14 +348,14 @@ class Marconi3Strategy(EvictionStrategy):
 
         flop_eff_values = []
         for n, op, dt, cp in candidates:
-            flops = self._node_flops_savings(dt, cp)
+            flop = self._node_flop_savings(dt, cp)
             if op == "leaf":
                 mem = self._node_memory_occupy(dt, cp, n.has_mamba_state)
             elif op == "mamba" and len(n.children) == 1:
                 mem = self._mamba_memory_occupy()
             else:
                 mem = 0
-            flop_eff_values.append(flops / mem if mem > 0 else 0.0)
+            flop_eff_values.append(flop / mem if mem > 0 else 0.0)
 
         norm_recency = _normalize(recency_values)
         norm_flop_eff = _normalize(flop_eff_values)
@@ -386,7 +375,7 @@ class Marconi3Strategy(EvictionStrategy):
     ) -> List[Tuple[float, RadixNode, EvictOp]]:
         """Marconi2-style normalisation with FLOP efficiency as depth metric.
 
-        flop_eff = flops_savings / memory_occupy.
+        flop_eff = flop_savings / memory_occupy.
         score = norm_r + alpha * norm_d
         """
         recency_values = [
@@ -396,12 +385,12 @@ class Marconi3Strategy(EvictionStrategy):
 
         flop_eff_values = []
         for n, op, dt, cp in candidates:
-            flops = self._node_flops_savings(dt, cp)
+            flop = self._node_flop_savings(dt, cp)
             if op == "leaf":
                 mem = self._node_memory_occupy(dt, cp, n.has_mamba_state)
             else:
                 mem = self._mamba_memory_occupy()
-            flop_eff_values.append(flops / mem if mem > 0 else 0.0)
+            flop_eff_values.append(flop / mem if mem > 0 else 0.0)
 
         norm_recency = _normalize(recency_values)
         norm_flop_eff = _normalize(flop_eff_values)
@@ -422,13 +411,13 @@ class Marconi3Strategy(EvictionStrategy):
     ) -> List[Tuple[float, RadixNode, EvictOp]]:
         """Raw FLOP savings normalised, then divided by memory occupy.
 
-        raw_score = norm_r + alpha * norm_flops
+        raw_score = norm_r + alpha * norm_flop
         score = raw_score / memory_occupy
         """
         recencies = [_effective_ts(n) for n, _, _, _ in candidates]
 
-        flops_values = [
-            self._node_flops_savings(dt, cp)
+        flop_values = [
+            self._node_flop_savings(dt, cp)
             for _, _, dt, cp in candidates
         ]
 
@@ -438,10 +427,10 @@ class Marconi3Strategy(EvictionStrategy):
         ]
 
         min_r, max_r = min(recencies), max(recencies)
-        min_f, max_f = min(flops_values), max(flops_values)
+        min_f, max_f = min(flop_values), max(flop_values)
 
         scored: List[Tuple[float, RadixNode, EvictOp]] = []
-        for (n, op, _, _), r, f, mem in zip(candidates, recencies, flops_values, mem_values):
+        for (n, op, _, _), r, f, mem in zip(candidates, recencies, flop_values, mem_values):
             norm_r = (r - min_r) / (max_r - min_r) if max_r > min_r else 0.0
             norm_f = (f - min_f) / (max_f - min_f) if max_f > min_f else 0.0
             raw_score = norm_r + self.alpha * norm_f
@@ -459,13 +448,13 @@ class Marconi3Strategy(EvictionStrategy):
     ) -> List[Tuple[float, RadixNode, EvictOp]]:
         """Raw FLOP savings normalised, then divided by memory occupy.
 
-        raw_score = norm_r + alpha * norm_flops
+        raw_score = norm_r + alpha * norm_flop
         score = raw_score / memory_occupy
         """
         recencies = [_effective_ts(n) for n, _, _, _ in candidates]
 
-        flops_values = [
-            self._node_flops_savings(dt, cp)
+        flop_values = [
+            self._node_flop_savings(dt, cp)
             for _, _, dt, cp in candidates
         ]
 
@@ -476,12 +465,12 @@ class Marconi3Strategy(EvictionStrategy):
 
 
         norm_recency = _normalize(recencies, 0)
-        norm_flop = _normalize(flops_values, 0)
+        norm_flop = _normalize(flop_values, 0)
         min_r, max_r = min(recencies), max(recencies)
-        min_f, max_f = min(flops_values), max(flops_values)
+        min_f, max_f = min(flop_values), max(flop_values)
 
         scored: List[Tuple[float, RadixNode, EvictOp]] = []
-        for (n, op, _, _), norm1_r, r, norm1_f, f, mem in zip(candidates, norm_recency, recencies, norm_flop, flops_values, mem_values):
+        for (n, op, _, _), norm1_r, r, norm1_f, f, mem in zip(candidates, norm_recency, recencies, norm_flop, flop_values, mem_values):
             norm_r = (r - min_r) / (max_r - min_r) if max_r > min_r else 0.0
             norm_f = (f - min_f) / (max_f - min_f) if max_f > min_f else 0.0
             if abs(norm_r - norm1_r) > 1e-6 or abs(norm_f - norm1_f) > 1e-6:
