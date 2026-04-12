@@ -180,27 +180,11 @@ class BranchStrategy(EvictionStrategy):
                 n._branch_lru = ts  # type: ignore[attr-defined]
             return
 
-        # newtouch: deepest hit + selective ancestors.
-        last = matched_nodes[-1]
-        last._branch_lru = ts  # type: ignore[attr-defined]
-
-        # Walk from deepest matched upward.  ``cur_cp`` tracks the deepest
-        # mamba-state node we have already passed in this walk — i.e. the
-        # "previous checkpoint" relative to the node we are about to look
-        # at next.  When considering the next ancestor n, ``cur_cp`` is the
-        # deepest checkpoint strictly below n on the matched path.
-        cur_cp: Optional[RadixNode] = last if last.has_mamba_state else None
-        for i in range(len(matched_nodes) - 2, -1, -1):
+        for i in range(len(matched_nodes) - 1, -1, -1):
             n = matched_nodes[i]
-            if cur_cp is not None:
-                num_ch = len(cur_cp.children)
-                if num_ch > 1:
-                    # Previous checkpoint is a branch point → refresh n.
-                    n._branch_lru = ts  # type: ignore[attr-defined]
-                # num_ch == 0 (leaf) or num_ch == 1 (single-child): skip.
-            # Promote n to the current checkpoint for nodes higher up.
             if n.has_mamba_state:
-                cur_cp = n
+                n._branch_lru = ts  # type: ignore[attr-defined]
+                break
 
     # ------------------------------------------------------------------
     # Eviction

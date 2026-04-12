@@ -101,7 +101,8 @@ for ds in ["swesmith", "loogle", "narrativeqa", "sharegpt_90k_raw"]:
 # Two-tier examples: HBM=branch_nt at small capacity, DRAM=marconi3_ev1_nt at large capacity.
 for ds in ["swesmith", "loogle", "narrativeqa", "sharegpt_90k_raw"]:
     for page_size in [32]:
-        for hbm_cap in [10, 20, 40, 80, "inf"]:
+        # for hbm_cap in [2, 5, 10, 20, 40, 80, "inf"]:
+        for hbm_cap in [2, 5]:
         # for hbm_cap in [40, 80, 160]:
             EXPERIMENTS.append(dict(
                 page_size=page_size, dataset=ds,
@@ -115,14 +116,18 @@ for ds in ["swesmith", "loogle", "narrativeqa", "sharegpt_90k_raw"]:
             ))
 
 # Log datasets
-# ENABLE_LOG      = True
-# MAX_REQUESTS    = 1000
-# EXPERIMENTS: list[dict] = []
-# for ds in ["swesmith", "loogle", "narrativeqa", "sharegpt_90k_raw"]:
-#     for page_size in [1, 32]:
-#         for capacity in [20, 80, "inf"]:
-#             EXPERIMENTS.append(dict(page_size=page_size, strategy="marconi3_ev1_mn0",  capacity=capacity, dataset=ds))
-#             EXPERIMENTS.append(dict(page_size=page_size, strategy="branch_nt",  capacity=capacity, dataset=ds))
+ENABLE_LOG      = True
+MAX_REQUESTS    = 1000
+EXPERIMENTS: list[dict] = []
+for ds in ["swesmith", "loogle", "narrativeqa", "sharegpt_90k_raw"]:
+    for page_size in [32]:
+        # for hbm_cap in [2, 5, 10, 20, 40, 80, "inf"]:
+        for hbm_cap in [10]:
+            EXPERIMENTS.append(dict(
+                page_size=page_size, dataset=ds,
+                strategy="branch_nt", capacity=hbm_cap,
+                dram_strategy="marconi3_ev1_nt", dram_capacity="inf",
+            ))
 
 # ╔═══════════════════════════════════════════════════════════════════════════╗
 # ║                       END OF CONFIGURATION                                ║
@@ -228,6 +233,8 @@ def _sim_worker(args: Tuple) -> Dict[str, Any]:
             capacity_spec=str(cfg["capacity"]),
             ordering=cfg["ordering"],
             model_name=model.name,
+            dram_strategy=sim_spec.get("dram_strategy_name"),
+            dram_capacity_spec=str(cfg.get("dram_capacity", "0")),
         )
         logger = TreeLogger(log_dir / fname)
 

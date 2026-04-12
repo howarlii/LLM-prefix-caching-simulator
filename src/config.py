@@ -40,8 +40,8 @@ KV_BYTES_PER_TOKEN_DEFAULT = 2 * 28 * 4096 * 2
 # Used by metrics to convert FLOP counts and DRAM cache transfer volume into
 # wall-clock seconds.  Pass overrides explicitly to compute_run_metrics /
 # run_simulation; these are *defaults* for the entry-point CLIs only.
-DEFAULT_GPU_FLOPS = 989e12  * 0.2        # H100 SXM5 BF16 dense (~989 TFLOP/s), effictive 20%
-DEFAULT_PCIE_BANDWIDTH = 16 * 4e9 * 0.5  # 50% of PCIe Gen5 x16 (64 GB/s), according to Strata
+DEFAULT_GPU_FLOPS = 989e12  * 0.4        # H100 SXM5 BF16 dense (~989 TFLOP/s), effictive 20%
+DEFAULT_PCIE_BANDWIDTH = 16 * 4e9 * 0.9  # 50% of PCIe Gen5 x16 (64 GB/s), according to Strata
 
 
 def gb_to_token_capacity(gb: float, kv_bytes_per_token: int = KV_BYTES_PER_TOKEN_DEFAULT) -> int:
@@ -60,4 +60,5 @@ DEFAULT_TOKENIZER_NAME = os.environ.get("KV_SIM_TOKENIZER", "Qwen/Qwen3-0.6B")
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DATA_DIR = PROJECT_ROOT / "data"
 TOKEN_CACHE_DIR = DATA_DIR / "tokenized"
+PREPARED_CACHE_DIR = DATA_DIR / "prepared"
 RESULTS_DIR = PROJECT_ROOT / "results"

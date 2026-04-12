@@ -226,17 +226,11 @@ class Marconi3Strategy(EvictionStrategy):
             return
         ts = tree.clock
 
-        last = matched_nodes[-1]
-        last._m3_lru = ts  # type: ignore[attr-defined]
-
-        cur_cp: Optional[RadixNode] = last if last.has_mamba_state else None
-        for i in range(len(matched_nodes) - 2, -1, -1):
+        for i in range(len(matched_nodes) - 1, -1, -1):
             n = matched_nodes[i]
-            if cur_cp is not None and len(cur_cp.children) > 1:
-                # previous checkpoint is a branch point → refresh n
-                n._m3_lru = ts  # type: ignore[attr-defined]
             if n.has_mamba_state:
-                cur_cp = n
+                n._m3_lru = ts  # type: ignore[attr-defined]
+                break
 
     def on_nodes_inserted(
         self, tree: RadixTree, new_nodes: List[RadixNode]

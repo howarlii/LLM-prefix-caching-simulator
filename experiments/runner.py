@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import csv
 import json
+import pickle
 import re
 import sys
 from pathlib import Path
@@ -16,6 +17,7 @@ from src.config import (
     DEFAULT_GPU_FLOPS,
     DEFAULT_PCIE_BANDWIDTH,
     DEFAULT_TOKENIZER_NAME,
+    PREPARED_CACHE_DIR,
     gb_to_token_capacity,
     ensure_hf_cache_dirs,
 )
@@ -343,6 +345,31 @@ def persist_result_row(
             w.writerow(new_row)
 
 
+def _prepared_cache_path(
+    dataset: str,
+    ordering: str,
+    tokenizer_name: str,
+    *,
+    seed: int,
+    max_requests: Optional[int],
+    sessions_per_second: float,
+    words_per_min: float,
+    narrativeqa_docs: int,
+    sharegpt_conversations: int,
+) -> Path:
+    """Path of the post-tokenize, post-order pickle cache for one prep call."""
+    safe_tok = tokenizer_name.replace("/", "_")
+    n_label = "all" if max_requests is None else str(int(max_requests))
+    name = (
+        f"{dataset}__{ordering}__{safe_tok}"
+        f"__seed{seed}__n{n_label}"
+        f"__sps{sessions_per_second}__wpm{words_per_min}"
+        f"__nqa{narrativeqa_docs}__sgc{sharegpt_conversations}"
+        f".pkl"
+    )
+    return PREPARED_CACHE_DIR / name
+
+
 def prepare_requests(
     dataset: str,
     ordering: str,
@@ -357,12 +384,32 @@ def prepare_requests(
     sessions_per_second: float = 1.0,
     words_per_min: float = 90.0,
 ) -> List[TokenizedRequest]:
+    # ── Fast path: full prepared-list pickle cache ───────────────────
+    # Skips HF dataset loading + tokenization + ordering when a previous
+    # call with identical inputs has already been persisted.
+    cache_path = _prepared_cache_path(
+        dataset, ordering, tokenizer_name,
+        seed=seed,
+        max_requests=max_requests,
+        sessions_per_second=sessions_per_second,
+        words_per_min=words_per_min,
+        narrativeqa_docs=narrativeqa_docs,
+        sharegpt_conversations=sharegpt_conversations,
+    )
+    if not force_retokenize and cache_path.is_file():
+        try:
+            with cache_path.open("rb") as f:
+                return pickle.load(f)
+        except Exception:
+            pass  # corrupted cache → fall through and regenerate
+
     ensure_hf_cache_dirs()
     raw = load_raw_requests(
         dataset,
         narrativeqa_docs=narrativeqa_docs,
         sharegpt_conversations=sharegpt_conversations,
         seed=seed,
+        max_requests=max_requests,
     )
     if not raw:
         return []
@@ -391,12 +438,25 @@ def prepare_requests(
                     meta=meta,
                 )
             )
-        return order_requests(tok_moon, **order_kw)
-    tok = load_or_tokenize(
-        dataset,
-        raw,
-        tokenizer_name=tokenizer_name,
-        num_workers=tokenize_workers,
-        force_recompute=force_retokenize,
-    )
-    return order_requests(tok, **order_kw)
+        result = order_requests(tok_moon, **order_kw)
+    else:
+        tok = load_or_tokenize(
+            dataset,
+            raw,
+            tokenizer_name=tokenizer_name,
+            num_workers=tokenize_workers,
+            force_recompute=force_retokenize,
+        )
+        result = order_requests(tok, **order_kw)
+
+    # Persist for next time (best-effort).
+    try:
+        PREPARED_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        tmp_path = cache_path.with_suffix(cache_path.suffix + ".tmp")
+        with tmp_path.open("wb") as f:
+            pickle.dump(result, f, protocol=pickle.HIGHEST_PROTOCOL)
+        tmp_path.replace(cache_path)
+    except Exception:
+        pass
+
+    return result

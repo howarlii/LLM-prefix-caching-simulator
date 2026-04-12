@@ -79,18 +79,22 @@ class RawRequest:
     meta: Dict[str, Any]
 
 
-def _iter_loogle() -> Iterator[RawRequest]:
+def _iter_loogle(max_requests: Optional[int] = None) -> Iterator[RawRequest]:
     ensure_hf_cache_dirs()
     from datasets import load_dataset
 
     ds = load_dataset("bigai-nlco/LooGLE", "shortdep_qa", split="test")
+    yielded = 0
     for i, row in enumerate(ds):
+        if max_requests is not None and yielded >= max_requests:
+            return
         ctx = row.get("context") or ""
         q = row.get("question") or ""
         title = row.get("title") or ""
         gid = f"loogle:{title}:{_stable_text_digest(ctx)}"
         text = f"{ctx}{q}"
         yield RawRequest(text=text, group_id=gid, meta={"dataset": "loogle", "idx": i})
+        yielded += 1
 
 
 def _narrativeqa_doc_text(row: dict) -> str:
@@ -114,6 +118,7 @@ def _iter_narrativeqa(
     max_tokens: int = 128_000,
     num_documents: int = 50,
     seed: int = 0,
+    max_requests: Optional[int] = None,
 ) -> Iterator[RawRequest]:
     ensure_hf_cache_dirs()
     from datasets import load_dataset
@@ -144,8 +149,11 @@ def _iter_narrativeqa(
             continue
         picked.append(did)
 
+    yielded = 0
     for did in picked:
         for j, row in enumerate(by_doc[did]):
+            if max_requests is not None and yielded >= max_requests:
+                return
             text_body = _narrativeqa_doc_text(row)
             qobj = row.get("question") or {}
             if isinstance(qobj, str):
@@ -158,6 +166,7 @@ def _iter_narrativeqa(
                 group_id=f"narrativeqa:{did}",
                 meta={"dataset": "narrativeqa", "doc": did, "q": j},
             )
+            yielded += 1
 
 
 def _normalize_sharegpt_conversation_list(conv: Any) -> List[Any]:
@@ -202,7 +211,11 @@ def _yield_sharegpt_style_requests(
         )
 
 
-def _iter_sharegpt(max_conversations: int = 10_000, seed: int = 0) -> Iterator[RawRequest]:
+def _iter_sharegpt(
+    max_conversations: int = 10_000,
+    seed: int = 0,
+    max_requests: Optional[int] = None,
+) -> Iterator[RawRequest]:
     ensure_hf_cache_dirs()
     from datasets import load_dataset
 
@@ -213,22 +226,30 @@ def _iter_sharegpt(max_conversations: int = 10_000, seed: int = 0) -> Iterator[R
         streaming=True,
     )
     convo_count = 0
+    yielded = 0
     for idx, row in enumerate(ds):
         if convo_count >= max_conversations:
             break
+        if max_requests is not None and yielded >= max_requests:
+            return
         conv = row.get("conversations")
         turns = _normalize_sharegpt_conversation_list(conv)
         if not turns:
             continue
         convo_count += 1
-        yield from _yield_sharegpt_style_requests(
+        for req in _yield_sharegpt_style_requests(
             idx, turns, meta_dataset="sharegpt", group_prefix="sharegpt"
-        )
+        ):
+            yield req
+            yielded += 1
+            if max_requests is not None and yielded >= max_requests:
+                return
 
 
 def _iter_sharegpt_90k_raw(
     max_conversations: int = 10_000,
     seed: int = 0,
+    max_requests: Optional[int] = None,
 ) -> Iterator[RawRequest]:
     """Stream philschmid/sharegpt-raw 90k JSON (sharegpt_90k_raw_dataset/, two parts) from Hugging Face."""
     del seed  # reserved for API parity with other loaders
@@ -238,7 +259,10 @@ def _iter_sharegpt_90k_raw(
 
     conv_idx = 0
     convo_count = 0
+    yielded = 0
     for rel in _SHAREGPT_90K_JSON_FILES:
+        if max_requests is not None and yielded >= max_requests:
+            return
         path = hf_hub_download(
             repo_id=_SHAREGPT_RAW_HF_REPO,
             filename=rel,
@@ -248,6 +272,8 @@ def _iter_sharegpt_90k_raw(
             for row in ijson.items(f, "item"):
                 if convo_count >= max_conversations:
                     return
+                if max_requests is not None and yielded >= max_requests:
+                    return
                 if not isinstance(row, dict):
                     continue
                 conv = row.get("conversations")
@@ -255,12 +281,16 @@ def _iter_sharegpt_90k_raw(
                 if not turns:
                     continue
                 convo_count += 1
-                yield from _yield_sharegpt_style_requests(
+                for req in _yield_sharegpt_style_requests(
                     conv_idx,
                     turns,
                     meta_dataset="sharegpt_90k_raw",
                     group_prefix="sharegpt_90k_raw",
-                )
+                ):
+                    yield req
+                    yielded += 1
+                    if max_requests is not None and yielded >= max_requests:
+                        return
                 conv_idx += 1
 
 
@@ -288,7 +318,10 @@ def _yield_chat_messages_requests(
         )
 
 
-def _iter_swe_smith(max_conversations: int = 10_000) -> Iterator[RawRequest]:
+def _iter_swe_smith(
+    max_conversations: int = 10_000,
+    max_requests: Optional[int] = None,
+) -> Iterator[RawRequest]:
     """Stream SWE-smith 66k trajectories (role/content chat format)."""
     ensure_hf_cache_dirs()
     from datasets import load_dataset
@@ -299,16 +332,23 @@ def _iter_swe_smith(max_conversations: int = 10_000) -> Iterator[RawRequest]:
         streaming=True,
     )
     convo_count = 0
+    yielded = 0
     for idx, row in enumerate(ds):
         if convo_count >= max_conversations:
             break
+        if max_requests is not None and yielded >= max_requests:
+            return
         messages = row.get("messages")
         if not isinstance(messages, list) or not messages:
             continue
         convo_count += 1
-        yield from _yield_chat_messages_requests(
+        for req in _yield_chat_messages_requests(
             idx, messages, meta_dataset="swe_smith", group_prefix="swe_smith"
-        )
+        ):
+            yield req
+            yielded += 1
+            if max_requests is not None and yielded >= max_requests:
+                return
 
 
 def _iter_mooncake_trace(jsonl_path: Path, dataset_key: str) -> Iterator[RawRequest]:
@@ -363,31 +403,46 @@ def load_raw_requests(
     narrativeqa_docs: int = 50,
     sharegpt_conversations: int = 10_000,
     seed: int = 0,
+    max_requests: Optional[int] = None,
 ) -> List[RawRequest]:
-    """Materialize a dataset into a list of :class:`RawRequest`."""
+    """Materialize a dataset into a list of :class:`RawRequest`.
+
+    ``max_requests`` is forwarded to the underlying iterator so streaming
+    loaders can stop iterating once enough requests have been yielded.
+    """
     name = name.lower()
     if name == "reviewmt":
         return []
     if name == "loogle":
-        return list(_iter_loogle())
+        return list(_iter_loogle(max_requests=max_requests))
     if name == "narrativeqa":
-        return list(_iter_narrativeqa(num_documents=narrativeqa_docs, seed=seed))
+        return list(_iter_narrativeqa(
+            num_documents=narrativeqa_docs, seed=seed, max_requests=max_requests,
+        ))
     if name == "sharegpt":
-        return list(_iter_sharegpt(max_conversations=sharegpt_conversations, seed=seed))
+        return list(_iter_sharegpt(
+            max_conversations=sharegpt_conversations, seed=seed,
+            max_requests=max_requests,
+        ))
     if name in ("swe_smith", "swesmith", "swe-smith"):
-        return list(
-            _iter_swe_smith(max_conversations=sharegpt_conversations)
-        )
+        return list(_iter_swe_smith(
+            max_conversations=sharegpt_conversations,
+            max_requests=max_requests,
+        ))
     if sharegpt_90k_raw_canonical_name(name) is not None:
-        return list(
-            _iter_sharegpt_90k_raw(
-                max_conversations=sharegpt_conversations,
-                seed=seed,
-            )
-        )
+        return list(_iter_sharegpt_90k_raw(
+            max_conversations=sharegpt_conversations,
+            seed=seed,
+            max_requests=max_requests,
+        ))
     moon_key = mooncake_trace_canonical_name(name)
     if moon_key is not None:
-        return list(_iter_mooncake_trace(mooncake_trace_jsonl_path(name), moon_key))
+        # Mooncake traces must be sorted by timestamp before truncation;
+        # iter already sorts, so a post-sort slice is correct.
+        out = list(_iter_mooncake_trace(mooncake_trace_jsonl_path(name), moon_key))
+        if max_requests is not None:
+            out = out[:max_requests]
+        return out
     raise ValueError(
         f"Unknown dataset {name!r}; choose from loogle, narrativeqa, sharegpt, sharegpt_90k_raw, "
         f"swe_smith, reviewmt, mooncake_toolagent, mooncake_conversation (aliases: toolagent_trace, "
