@@ -75,6 +75,22 @@ def _effective_ts(node: RadixNode) -> int:
     return getattr(node, "_branch_lru", node.last_access)
 
 
+def _ef_evictable(node: RadixNode, root: RadixNode) -> bool:
+    """``_ef`` filter: evictable iff ``len(children)==1`` OR no other node
+    with a mamba state lies strictly between ``node`` and the previous
+    branching point (or root) along the ancestor chain."""
+    if len(node.children) == 1:
+        return True
+    cur = node.parent
+    while cur is not None and cur is not root:
+        if len(cur.children) >= 2:
+            break
+        if cur.has_mamba_state:
+            return False
+        cur = cur.parent
+    return True
+
+
 class BranchStrategy(EvictionStrategy):
     """Marconi-style admission with LRU eviction at marconi3_ev1 granularity.
 
@@ -100,11 +116,13 @@ class BranchStrategy(EvictionStrategy):
     def __init__(
         self,
         newtouch: bool = False,
+        evict_filter: bool = False,
         model: ModelConfig = DEFAULT_MODEL,
         gpu_flops: Optional[float] = None,
         pcie_bandwidth: Optional[float] = None,
     ) -> None:
         self.newtouch = newtouch
+        self.evict_filter = evict_filter
         self.model = model
         self.gpu_flops = gpu_flops
         self.pcie_bandwidth = pcie_bandwidth
@@ -207,6 +225,9 @@ class BranchStrategy(EvictionStrategy):
             elif node.has_mamba_state:
                 candidates.append((node, "mamba"))
             q.extend(node.children.values())
+        if self.evict_filter:
+            root = tree.root
+            candidates = [c for c in candidates if _ef_evictable(c[0], root)]
         return candidates
 
     def select_eviction(

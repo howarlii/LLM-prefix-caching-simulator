@@ -53,6 +53,55 @@ from src.strategies.marconi import _normalize
 _MIN_CHAIN_TOKENS_FOR_MID_CHECKPOINT = 2048
 
 
+def _nearest_mamba_in_subtree(root: RadixNode) -> Optional[RadixNode]:
+    """Find the descendant (or root itself) with a mamba state having the
+    smallest ``depth_tokens``.  Returns ``None`` if no such node exists."""
+    best: Optional[RadixNode] = None
+    q: deque[RadixNode] = deque([root])
+    while q:
+        cur = q.popleft()
+        if cur.has_mamba_state:
+            if best is None or cur.depth_tokens < best.depth_tokens:
+                best = cur
+            # No need to descend further into this branch — we want the
+            # nearest (shallowest) mamba node.
+            continue
+        for ch in cur.children.values():
+            q.append(ch)
+    return best
+
+
+def _branch_mamba_weight(node: RadixNode) -> float:
+    """Sum over each child subtree of ``(1 - node.depth_tokens / x.depth_tokens)``
+    where ``x`` is the nearest mamba-state descendant in that subtree.
+    Subtrees with no mamba descendant contribute 0.  Used by ev2 to
+    weight non-leaf candidates by how much downstream cache they enable."""
+    base = node.depth_tokens
+    total = 0.0
+    for child in node.children.values():
+        x = _nearest_mamba_in_subtree(child)
+        if x is None or x.depth_tokens <= 0:
+            continue
+        total += 1.0 - base / x.depth_tokens
+    return total
+
+
+def _ef_evictable(node: RadixNode, root: RadixNode) -> bool:
+    """``_ef`` filter: evictable iff ``len(children)==1`` OR no other node
+    with a mamba state lies strictly between ``node`` and the previous
+    branching point (or root) along the ancestor chain."""
+    if len(node.children) == 1:
+        return True
+    cur = node.parent
+    while cur is not None and cur is not root:
+        if len(cur.children) >= 2:
+            break
+        if cur.has_mamba_state:
+            return False
+        cur = cur.parent
+    return True
+
+
 def _effective_ts(node: RadixNode) -> int:
     """Recency sort key: prefer the strategy-managed timestamp, fall back to last_access.
 
@@ -109,6 +158,7 @@ class Marconi3Strategy(EvictionStrategy):
         evict_mode: str = "ev0",
         use_mid_chain_checkpoint: bool = False,
         newtouch: bool = False,
+        evict_filter: bool = False,
         model: ModelConfig = DEFAULT_MODEL,
         gpu_flops: Optional[float] = None,
         pcie_bandwidth: Optional[float] = None,
@@ -117,6 +167,7 @@ class Marconi3Strategy(EvictionStrategy):
         self.evict_mode = evict_mode
         self.use_mid_chain_checkpoint = use_mid_chain_checkpoint
         self.newtouch = newtouch
+        self.evict_filter = evict_filter
         self.model = model
         self.num_ssm_layers = model.num_ssm_layers
         self.num_attn_layers = model.num_attn_layers
@@ -314,6 +365,12 @@ class Marconi3Strategy(EvictionStrategy):
             for ch in node.children.values():
                 q.append((ch, child_checkpoint))
 
+        if self.evict_filter:
+            root = tree.root
+            candidates = [
+                c for c in candidates if _ef_evictable(c[0], root)
+            ]
+
         if not candidates:
             return []
 
@@ -392,9 +449,13 @@ class Marconi3Strategy(EvictionStrategy):
         scored: List[Tuple[float, RadixNode, EvictOp]] = []
         for (n, op, _, _), rec, eff in zip(candidates, norm_recency, norm_flop_eff):
             score = self.alpha * eff + rec
+            n._stra_norm_flop_eff = eff  # type: ignore[attr-defined]
+            n._stra_norm_recency = rec  # type: ignore[attr-defined]
             scored.append((score, n, op))
 
         scored.sort(key=lambda x: x[0])
+        # if scored[0][2] == 'leaf':
+        #     print("what")
         return scored
 
     def _score_ev2(
@@ -403,33 +464,43 @@ class Marconi3Strategy(EvictionStrategy):
         current_ts: int,
         tree: RadixTree,
     ) -> List[Tuple[float, RadixNode, EvictOp]]:
-        """Raw FLOP savings normalised, then divided by memory occupy.
+        """ev1 with branch-weighted FLOP efficiency.
 
-        raw_score = norm_r + alpha * norm_flop
-        score = raw_score / memory_occupy
+        ``weighted_flop_eff = flop_eff * n_weight``, where for a leaf
+        candidate ``n_weight = 1`` and for a non-leaf candidate
+        ``n_weight = sum_{child subtree} (1 - n.depth_tokens / x.depth_tokens)``
+        with ``x`` the nearest mamba-state descendant in that subtree.
+        ``score = norm_r + alpha * norm_weighted_flop_eff`` (ev1 form).
         """
-        recencies = [_effective_ts(n) for n, _, _, _ in candidates]
-
-        flop_values = [
-            self._node_flop_savings(dt, cp)
-            for _, _, dt, cp in candidates
+        recency_values = [
+            1.0 / max(current_ts - _effective_ts(n), 1)
+            for n, _, _, _ in candidates
         ]
 
-        mem_values = [
-            self._node_memory_occupy(dt, cp, n.has_mamba_state)
-            for n, _, dt, cp in candidates
-        ]
+        weighted_flop_eff_values = []
+        for n, op, dt, cp in candidates:
+            flop = self._node_flop_savings(dt, cp)
+            if op == "leaf":
+                mem = self._node_memory_occupy(dt, cp, n.has_mamba_state)
+            else:
+                mem = self._mamba_memory_occupy()
+            flop_eff = flop / mem if mem > 0 else 0.0
 
-        min_r, max_r = min(recencies), max(recencies)
-        min_f, max_f = min(flop_values), max(flop_values)
+            if op == "leaf" or not n.children:
+                n_weight = 1.0
+            else:
+                n_weight = _branch_mamba_weight(n)
+            weighted_flop_eff_values.append(flop_eff * n_weight)
+
+        norm_recency = _normalize(recency_values)
+        norm_weighted = _normalize(weighted_flop_eff_values)
 
         scored: List[Tuple[float, RadixNode, EvictOp]] = []
-        for (n, op, _, _), r, f, mem in zip(candidates, recencies, flop_values, mem_values):
-            norm_r = (r - min_r) / (max_r - min_r) if max_r > min_r else 0.0
-            norm_f = (f - min_f) / (max_f - min_f) if max_f > min_f else 0.0
-            raw_score = norm_r + self.alpha * norm_f
-            assert mem > 0, f"Memory occupy is zero for node {n}, cannot divide by zero in ev2 scoring."
-            scored.append((raw_score / mem, n, op))
+        for (n, op, _, _), rec, eff in zip(candidates, norm_recency, norm_weighted):
+            score = self.alpha * eff + rec
+            n._stra_norm_flop_eff = eff  # type: ignore[attr-defined]
+            n._stra_norm_recency = rec  # type: ignore[attr-defined]
+            scored.append((score, n, op))
 
         scored.sort(key=lambda x: x[0])
         return scored
@@ -440,39 +511,45 @@ class Marconi3Strategy(EvictionStrategy):
         current_ts: int,
         tree: RadixTree,
     ) -> List[Tuple[float, RadixNode, EvictOp]]:
-        """Raw FLOP savings normalised, then divided by memory occupy.
+        """ev1 with branch-weighted FLOP efficiency.
 
-        raw_score = norm_r + alpha * norm_flop
-        score = raw_score / memory_occupy
+        ``weighted_flop_eff = flop_eff * n_weight``, where for a leaf
+        candidate ``n_weight = 1`` and for a non-leaf candidate
+        ``n_weight = sum_{child subtree} (1 - n.depth_tokens / x.depth_tokens)``
+        with ``x`` the nearest mamba-state descendant in that subtree.
+        ``score = norm_r + alpha * norm_weighted_flop_eff`` (ev1 form).
         """
-        recencies = [_effective_ts(n) for n, _, _, _ in candidates]
-
-        flop_values = [
-            self._node_flop_savings(dt, cp)
-            for _, _, dt, cp in candidates
+        recency_values = [
+            1.0 / max(current_ts - _effective_ts(n), 1)
+            for n, _, _, _ in candidates
         ]
 
-        mem_values = [
-            self._node_memory_occupy(dt, cp, n.has_mamba_state)
-            for n, _, dt, cp in candidates
-        ]
+        weighted_flop_eff_values = []
+        for n, op, dt, cp in candidates:
+            flop = self._node_flop_savings(dt, cp)
+            if op == "leaf":
+                mem = self._node_memory_occupy(dt, cp, n.has_mamba_state)
+            elif len(n.children) > 1:
+                mem = 0
+            else:
+                mem = self._mamba_memory_occupy()
+            flop_eff = flop / mem if mem > 0 else float("inf")
 
+            if op == "leaf" or not n.children:
+                n_weight = 1.0
+            else:
+                n_weight = _branch_mamba_weight(n)
+            weighted_flop_eff_values.append(flop_eff * n_weight)
 
-        norm_recency = _normalize(recencies, 0)
-        norm_flop = _normalize(flop_values, 0)
-        min_r, max_r = min(recencies), max(recencies)
-        min_f, max_f = min(flop_values), max(flop_values)
+        norm_recency = _normalize(recency_values)
+        norm_weighted = _normalize(weighted_flop_eff_values)
 
         scored: List[Tuple[float, RadixNode, EvictOp]] = []
-        for (n, op, _, _), norm1_r, r, norm1_f, f, mem in zip(candidates, norm_recency, recencies, norm_flop, flop_values, mem_values):
-            norm_r = (r - min_r) / (max_r - min_r) if max_r > min_r else 0.0
-            norm_f = (f - min_f) / (max_f - min_f) if max_f > min_f else 0.0
-            if abs(norm_r - norm1_r) > 1e-6 or abs(norm_f - norm1_f) > 1e-6:
-                print(f"Warning: Normalisation mismatch for node {n}. norm_r: {norm_r} vs {norm1_r}, norm_f: {norm_f} vs {norm1_f}")
-                assert False, f"Normalisation mismatch between _normalize and manual min-max for node {n}"
-            raw_score = norm_r + self.alpha * norm_f
-            assert mem > 0, f"Memory occupy is zero for node {n}, cannot divide by zero in ev2 scoring."
-            scored.append((raw_score / mem, n, op))
+        for (n, op, _, _), rec, eff in zip(candidates, norm_recency, norm_weighted):
+            score = self.alpha * eff + rec
+            n._stra_norm_flop_eff = eff  # type: ignore[attr-defined]
+            n._stra_norm_recency = rec  # type: ignore[attr-defined]
+            scored.append((score, n, op))
 
         scored.sort(key=lambda x: x[0])
         return scored

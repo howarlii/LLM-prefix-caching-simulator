@@ -58,6 +58,11 @@ class RadixNode:
     def num_pages(self) -> int:
         return len(self.pages)
 
+    @property
+    def node_id(self) -> int:
+        """Stable identifier used in logs / viewer (alias of ``creation_order``)."""
+        return self.creation_order
+
     def is_leaf(self) -> bool:
         return len(self.children) == 0
 
@@ -91,9 +96,13 @@ class RadixTree:
         # Incremental indexes — avoid full-tree BFS on every eviction call.
         self._leaf_set: Set[RadixNode] = set()
         self._mamba_state_nodes: Set[RadixNode] = set()
-        # Split log for external consumers (e.g. tree logger / viewer).
-        # Each entry: (old_id, prefix_id, prefix_pid, prefix_len, suffix_id, suffix_len)
-        self._pending_splits: List[Tuple[int, int, int, int, int, int]] = []
+        # Chronological mutation log for external consumers (tree logger / viewer).
+        # Entries are either:
+        #   ("SP", (old_id, prefix_id, prefix_pid, prefix_len, suffix_id, suffix_len))
+        #   ("I",  (node_id, parent_id, num_tokens))
+        # Preserving insertion order lets the viewer replay splits that refer
+        # to just-inserted nodes (e.g. set_mamba_at_depth splitting a fresh leaf).
+        self._pending_ops: List[Tuple[str, tuple]] = []
 
     @property
     def root(self) -> RadixNode:
@@ -218,20 +227,17 @@ class RadixTree:
 
         # Record for logger: (old_id, prefix_id, prefix_pid, prefix_len, suffix_id, suffix_len)
         parent_id = node.parent.creation_order if node.parent else 0
-        self._pending_splits.append((
+        self._pending_ops.append(("SP", (
             old_id, node.creation_order, parent_id,
             node.num_tokens, suffix.creation_order, suffix.num_tokens,
-        ))
+        )))
 
         return suffix
 
-    def drain_pending_splits(self) -> List[Tuple[int, int, int, int, int, int]]:
-        """Return and clear pending split records for logging.
-
-        Each entry: ``(old_id, prefix_id, prefix_pid, prefix_len, suffix_id, suffix_len)``.
-        """
-        out = self._pending_splits
-        self._pending_splits = []
+    def drain_pending_ops(self) -> List[Tuple[str, tuple]]:
+        """Return and clear chronological mutation records for logging."""
+        out = self._pending_ops
+        self._pending_ops = []
         return out
 
     # ------------------------------------------------------------------
@@ -329,6 +335,12 @@ class RadixTree:
         parent.children[pages[0]] = child
         self._add_token_count(child_tokens)
         self._leaf_set.add(child)
+<<<<<<< Updated upstream
+=======
+        # Record for logger (chronological — must precede any later split that
+        # may mutate this leaf's creation_order).
+        self._pending_ops.append(("I", (order, parent.creation_order, child_tokens)))
+>>>>>>> Stashed changes
         return child
 
     def set_mamba_at_depth(

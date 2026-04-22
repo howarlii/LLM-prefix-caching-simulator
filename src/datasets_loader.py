@@ -351,6 +351,96 @@ def _iter_swe_smith(
                 return
 
 
+def _iter_oasst1(
+    max_conversations: int = 10_000,
+    seed: int = 0,
+    max_requests: Optional[int] = None,
+    lang: Optional[str] = "en",
+) -> Iterator[RawRequest]:
+    """Stream OpenAssistant/oasst1. Each message tree yields one request per node
+    (root-to-node path concatenated), so sibling branches share prefixes — a
+    good stress test for branching radix-cache behavior.
+
+    ``lang``: ISO code filter (default ``"en"``). Pass ``None`` for all languages.
+    """
+    del seed  # deterministic order (by tree id) — no sampling needed
+    ensure_hf_cache_dirs()
+    from datasets import load_dataset
+
+    ds = load_dataset("OpenAssistant/oasst1", split="train")
+
+    # Group messages by tree and index by message_id for O(1) parent lookup.
+    trees: Dict[str, Dict[str, dict]] = {}
+    tree_order: List[str] = []
+    for row in ds:
+        if lang is not None and (row.get("lang") or "") != lang:
+            continue
+        if row.get("deleted"):
+            continue
+        mid = row.get("message_id")
+        tid = row.get("message_tree_id")
+        if not mid or not tid:
+            continue
+        if tid not in trees:
+            trees[tid] = {}
+            tree_order.append(tid)
+        trees[tid][mid] = row
+
+    yielded = 0
+    convo_count = 0
+    for tid in tree_order:
+        if convo_count >= max_conversations:
+            return
+        if max_requests is not None and yielded >= max_requests:
+            return
+
+        nodes = trees[tid]
+        children: Dict[Optional[str], List[str]] = {}
+        for mid, row in nodes.items():
+            children.setdefault(row.get("parent_id"), []).append(mid)
+        # Stable ordering within siblings (by message_id) for reproducibility.
+        for sibs in children.values():
+            sibs.sort()
+
+        roots = children.get(None, [])
+        if not roots:
+            continue
+        convo_count += 1
+
+        def _format(row: dict) -> str:
+            role = row.get("role") or ""
+            text = row.get("text") or ""
+            return f"<|{role}|>{text}"
+
+        # DFS; maintain accumulated prefix. Emit one request per node.
+        stack: List[tuple[str, List[str], int]] = []
+        for r in roots:
+            stack.append((r, [], 0))
+        turn_counter = 0
+        while stack:
+            if max_requests is not None and yielded >= max_requests:
+                return
+            mid, prefix_parts, depth = stack.pop()
+            row = nodes[mid]
+            new_parts = prefix_parts + [_format(row)]
+            text = "".join(new_parts)
+            yield RawRequest(
+                text=text,
+                group_id=f"oasst1:{tid}",
+                meta={
+                    "dataset": "oasst1",
+                    "tree": tid,
+                    "message_id": mid,
+                    "depth": depth,
+                    "turn": turn_counter,
+                },
+            )
+            yielded += 1
+            turn_counter += 1
+            for child in children.get(mid, []):
+                stack.append((child, new_parts, depth + 1))
+
+
 def _iter_mooncake_trace(jsonl_path: Path, dataset_key: str) -> Iterator[RawRequest]:
     """Load Mooncake-style traces: each line has timestamp, lengths, and hash_ids (block ids)."""
     if not jsonl_path.is_file():
@@ -424,6 +514,12 @@ def load_raw_requests(
             max_conversations=sharegpt_conversations, seed=seed,
             max_requests=max_requests,
         ))
+    if name in ("oasst1", "oasst", "openassistant", "openassistant_oasst1"):
+        return list(_iter_oasst1(
+            max_conversations=sharegpt_conversations,
+            seed=seed,
+            max_requests=max_requests,
+        ))
     if name in ("swe_smith", "swesmith", "swe-smith"):
         return list(_iter_swe_smith(
             max_conversations=sharegpt_conversations,
@@ -445,8 +541,8 @@ def load_raw_requests(
         return out
     raise ValueError(
         f"Unknown dataset {name!r}; choose from loogle, narrativeqa, sharegpt, sharegpt_90k_raw, "
-        f"swe_smith, reviewmt, mooncake_toolagent, mooncake_conversation (aliases: toolagent_trace, "
-        f"conversation_trace, sharegpt_raw, philschmid_sharegpt_raw, swesmith, swe-smith)"
+        f"swe_smith, oasst1, reviewmt, mooncake_toolagent, mooncake_conversation (aliases: toolagent_trace, "
+        f"conversation_trace, sharegpt_raw, philschmid_sharegpt_raw, swesmith, swe-smith, oasst, openassistant)"
     )
 
 

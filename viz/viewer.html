@@ -91,7 +91,7 @@ let playing = false;
 let playTimer = null;
 
 // In-memory tree (rebuilt from events)
-// id -> {id, pid, pageLen, children: Set, ac, la, mamba, crf, state, dead}
+// id -> {id, pid, pageLen, children: Set, ac, la, mamba, crf, stra, state, dead}
 let treeNodes = new Map();
 const ROOT_ID = 0;
 
@@ -180,7 +180,7 @@ function resetTree() {
 }
 
 function mkRoot() {
-  return { id: ROOT_ID, pid: -1, pageLen: 0, children: new Set(), ac: 0, la: 0, mamba: false, crf: null, state: "", dead: false };
+  return { id: ROOT_ID, pid: -1, pageLen: 0, children: new Set(), ac: 0, la: 0, mamba: false, crf: null, stra: null, state: "", dead: false };
 }
 
 // ── Checkpoints ────────────────────────────────────────────────────────
@@ -247,7 +247,8 @@ function applyEvent(ev, track, reqIdx) {
       // If a ghost exists at this id (re-inserted), remove it
       ghostNodes.delete(ev.id);
       const node = { id: ev.id, pid: ev.pid, pageLen: ev.len, children: new Set(),
-                     ac: 1, la: 0, mamba: false, crf: null, state: track ? "new" : "", dead: false };
+                     ac: 1, la: 0, mamba: false, crf: null, stra: null,
+                     state: track ? "new" : "", dead: false };
       treeNodes.set(ev.id, node);
       const p = treeNodes.get(ev.pid);
       if (p) p.children.add(ev.id);
@@ -267,36 +268,61 @@ function applyEvent(ev, track, reqIdx) {
       // Node split: old node (oid) → prefix (pid) + suffix (sid).
       // Suffix keeps old id; prefix gets a new id inserted between parent and suffix.
       const old = treeNodes.get(ev.oid);
-      if (old) {
-        const oldParent = treeNodes.get(old.pid);
-        // Create prefix node (new id, replaces old in parent)
-        const prefix = {
-          id: ev.pid, pid: old.pid, pageLen: ev.plen,
-          children: new Set([ev.sid]),
-          ac: old.ac, la: old.la, mamba: false, crf: null,
-          state: track ? old.state : "", dead: false,
-        };
-        treeNodes.set(ev.pid, prefix);
-        if (oldParent) {
-          oldParent.children.delete(ev.oid);
-          oldParent.children.add(ev.pid);
+      if (!old) {
+        console.warn("SP references unknown node", ev);
+        break;
+      }
+      const oldParent = treeNodes.get(old.pid);
+      // Create prefix node (new id, replaces old in parent)
+      const prefix = {
+        id: ev.pid, pid: old.pid, pageLen: ev.plen,
+        children: new Set([ev.sid]),
+        ac: old.ac, la: old.la, mamba: false, crf: null, stra: null,
+        state: track ? old.state : "", dead: false,
+      };
+      treeNodes.set(ev.pid, prefix);
+      if (oldParent) {
+        oldParent.children.delete(ev.oid);
+        oldParent.children.add(ev.pid);
+      }
+      // Mutate old node into suffix
+      old.pid = ev.pid;
+      old.pageLen = ev.slen;
+      // mamba state stays on suffix (unchanged)
+      break;
+    }
+    case "SS": {
+      // Full _stra_* snapshot — update every node's stra map.
+      // Nodes missing from the snapshot keep their previous value.
+      if (Array.isArray(ev.nodes)) {
+        for (const entry of ev.nodes) {
+          const n = treeNodes.get(entry.id);
+          if (!n) continue;
+          const stra = {};
+          for (const k in entry) if (k !== "id") stra[k] = entry[k];
+          n.stra = stra;
         }
-        // Mutate old node into suffix
-        old.pid = ev.pid;
-        old.pageLen = ev.slen;
-        // mamba state stays on suffix (unchanged)
       }
       break;
     }
     case "E": {
-      for (const id of ev.ids) {
+      const straList = Array.isArray(ev.stra) ? ev.stra : null;
+      for (let k = 0; k < ev.ids.length; k++) {
+        const id = ev.ids[k];
         const n = treeNodes.get(id);
         if (!n) continue;
-        // Save as ghost for visual display
+        // Prefer stra from the E event (captured at eviction time);
+        // fall back to the node's last-known stra (from SS snapshots).
+        let stra = null;
+        if (straList && straList[k] && Object.keys(straList[k]).length > 0) {
+          stra = straList[k];
+        } else if (n.stra) {
+          stra = n.stra;
+        }
         if (track) {
           ghostNodes.set(id, {
             id: n.id, pid: n.pid, pageLen: n.pageLen,
-            ac: n.ac, la: n.la, mamba: n.mamba, crf: n.crf,
+            ac: n.ac, la: n.la, mamba: n.mamba, crf: n.crf, stra: stra,
             state: "evicted", dead: true, diedAtReq: reqIdx,
           });
         }
@@ -686,12 +712,17 @@ function updateTree() {
     .attr("stroke-width", d => nodeStrokeWidth(d.data.data))
     .attr("opacity", d => nodeOpacity(d.data.data));
 
-  // Labels: show for small trees; hide for large ones to keep rendering fast
+  // Labels: show for small trees; hide for large ones to keep rendering fast.
+  // Also hide on plain gray nodes (non-mamba, non-fork/leaf-highlighted)
+  // to reduce clutter — tooltip still shows full info on hover.
+  const forkLeafOnly = forkLeafToggle.checked;
   if (nodeCount < 500) {
     merged.select("text")
       .text(d => {
         const n = d.data.data;
         if (n.id === ROOT_ID) return "root";
+        // Plain gray node (no mamba, not in fork+leaf mode) → no label
+        if (!forkLeafOnly && !n.mamba && !n.dead) return "";
         let s = `${n.pageLen}t @${n._tokenDepth || 0}`;
         if (hasCrf) s += ` crf=${(n.crf ?? 0).toFixed(2)}`;
         else s += ` ac=${n.ac}`;
@@ -715,6 +746,16 @@ function updateTree() {
       if (n.dead) lines.push(n.state === "evicted" ? "JUST EVICTED" : `evicted (req #${n.diedAtReq})`);
       else if (n.state) lines.push(`state: ${n.state}`);
       if (!n.dead) lines.push(`children: ${n.children.size}`);
+      if (n.stra) {
+        lines.push("── stra ──");
+        for (const k of Object.keys(n.stra).sort()) {
+          const v = n.stra[k];
+          const vs = typeof v === "number"
+            ? (Number.isInteger(v) ? v.toString() : v.toFixed(6))
+            : JSON.stringify(v);
+          lines.push(`  ${k}: ${vs}`);
+        }
+      }
       tooltip.textContent = lines.join("\n");
       tooltip.style.display = "block";
     })

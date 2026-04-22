@@ -41,7 +41,13 @@ from experiments.runner import (
     run_simulation,
     strategy_from_name,
 )
+from src.strategies.oracle_ilp import OracleILPSolver
 from viz.tree_logger import TreeLogger, _log_filename
+
+
+# Per-experiment tunables for the ILP oracle (strategy == "oracle").
+ORACLE_TIME_LIMIT_S = 600          # CBC wall-clock limit
+ORACLE_RELAX = False               # True = LP relaxation (upper bound, faster)
 
 # ╔═══════════════════════════════════════════════════════════════════════════╗
 # ║                          CONFIGURATION                                    ║
@@ -90,6 +96,7 @@ MAX_WORKERS     = 100
 EXPERIMENTS: list[dict] = []
 
 # Example: sweep page_size × capacity for marconi3 ablations
+<<<<<<< Updated upstream
 for ds in ["swesmith", "loogle", "narrativeqa", "sharegpt_90k_raw"]:
 # for ds in ["swesmith"]:
     for page_size in [32]:
@@ -101,8 +108,7 @@ for ds in ["swesmith", "loogle", "narrativeqa", "sharegpt_90k_raw"]:
 # Two-tier examples: HBM=branch_nt at small capacity, DRAM=marconi3_ev1_nt at large capacity.
 for ds in ["swesmith", "loogle", "narrativeqa", "sharegpt_90k_raw"]:
     for page_size in [32]:
-        # for hbm_cap in [2, 5, 10, 20, 40, 80, "inf"]:
-        for hbm_cap in [2, 5]:
+        for hbm_cap in [10, 20, 40, 80, "inf"]:
         # for hbm_cap in [40, 80, 160]:
             EXPERIMENTS.append(dict(
                 page_size=page_size, dataset=ds,
@@ -114,20 +120,61 @@ for ds in ["swesmith", "loogle", "narrativeqa", "sharegpt_90k_raw"]:
                 strategy="marconi3_ev1_nt", capacity=hbm_cap,
                 dram_strategy="marconi3_ev1_nt", dram_capacity="inf",
             ))
+=======
+for ds in ["oasst1", "swesmith", "loogle", "narrativeqa", "sharegpt_90k_raw"]:
+# for ds in ["swesmith"]:
+    for page_size in [32]:
+        for capacity in [10, 20, 40, 80, 160]:
+        # for capacity in [20]:
+            # EXPERIMENTS.append(dict(page_size=page_size, dataset=ds, strategy="marconi3_ev1_nt", capacity=capacity))
+            # EXPERIMENTS.append(dict(page_size=page_size, dataset=ds, strategy="marconi3_ev1_nt_ef", capacity=capacity))
+            EXPERIMENTS.append(dict(page_size=page_size, dataset=ds, strategy="oracle", capacity=capacity))
+
+# Two-tier examples: HBM=branch_nt at small capacity, DRAM=marconi3_ev1_nt at large capacity.
+# for ds in ["oasst1", "swesmith", "loogle", "narrativeqa", "sharegpt_90k_raw"]:
+#     for page_size in [32]:
+#         # for hbm_cap in [2, 5, 10, 20, 40, 80, "inf"]:
+#         for hbm_cap in [2, 5]:
+#         # for hbm_cap in [40, 80, 160]:
+#             EXPERIMENTS.append(dict(
+#                 page_size=page_size, dataset=ds,
+#                 strategy="branch_nt", capacity=hbm_cap,
+#                 dram_strategy="marconi3_ev1_nt", dram_capacity="inf",
+#             ))
+#             EXPERIMENTS.append(dict(
+#                 page_size=page_size, dataset=ds,
+#                 strategy="marconi3_ev1_nt", capacity=hbm_cap,
+#                 dram_strategy="marconi3_ev1_nt", dram_capacity="inf",
+#             ))
+>>>>>>> Stashed changes
 
 # Log datasets
-ENABLE_LOG      = True
-MAX_REQUESTS    = 1000
-EXPERIMENTS: list[dict] = []
-for ds in ["swesmith", "loogle", "narrativeqa", "sharegpt_90k_raw"]:
-    for page_size in [32]:
-        # for hbm_cap in [2, 5, 10, 20, 40, 80, "inf"]:
-        for hbm_cap in [10]:
-            EXPERIMENTS.append(dict(
-                page_size=page_size, dataset=ds,
-                strategy="branch_nt", capacity=hbm_cap,
-                dram_strategy="marconi3_ev1_nt", dram_capacity="inf",
-            ))
+# ENABLE_LOG      = True
+# MAX_REQUESTS    = 1000
+# EXPERIMENTS: list[dict] = []
+<<<<<<< Updated upstream
+# for ds in ["swesmith", "loogle", "narrativeqa", "sharegpt_90k_raw"]:
+#     for page_size in [1, 32]:
+#         for capacity in [20, 80, "inf"]:
+#             EXPERIMENTS.append(dict(page_size=page_size, strategy="marconi3_ev1_mn0",  capacity=capacity, dataset=ds))
+#             EXPERIMENTS.append(dict(page_size=page_size, strategy="branch_nt",  capacity=capacity, dataset=ds))
+=======
+# # for ds in ["oasst1", "swesmith", "loogle", "narrativeqa", "sharegpt_90k_raw"]:
+# #     for page_size in [32]:
+# #         # for hbm_cap in [2, 5, 10, 20, 40, 80, "inf"]:
+# #         for hbm_cap in [10]:
+# #             EXPERIMENTS.append(dict(
+# #                 page_size=page_size, dataset=ds,
+# #                 strategy="branch_nt", capacity=hbm_cap,
+# #                 dram_strategy="marconi3_ev1_nt", dram_capacity="inf",
+# #             ))
+# for ds in ["oasst1", "swesmith", "loogle", "narrativeqa", "sharegpt_90k_raw"]:
+# # for ds in ["oasst1"]:
+#     for page_size in [32]:
+#         for capacity in [10, 'inf']:
+#             EXPERIMENTS.append(dict(page_size=page_size, dataset=ds, strategy="marconi3_ev2_nt", capacity=capacity))
+#             # EXPERIMENTS.append(dict(page_size=page_size, dataset=ds, strategy="marconi3_ev1_nt_ef", capacity=capacity))
+>>>>>>> Stashed changes
 
 # ╔═══════════════════════════════════════════════════════════════════════════╗
 # ║                       END OF CONFIGURATION                                ║
@@ -207,6 +254,27 @@ def _sim_worker(args: Tuple) -> Dict[str, Any]:
     reqs = _PREPARED[prep_key]
     model = ModelConfig.from_name(cfg["model_name"])
 
+<<<<<<< Updated upstream
+=======
+    # Oracle (ILP) branch — solve the offline optimum instead of running
+    # the simulator.  HBM-only; ``dram_*`` columns stay blank.
+    if (sim_spec["strategy_name"] or "").lower() == "oracle":
+        cap_tokens = sim_spec["cap"]
+        if cap_tokens is None:
+            raise ValueError("oracle strategy requires a finite HBM capacity (got 'inf')")
+        solver = OracleILPSolver(
+            requests_token_ids=[r.token_ids for r in reqs],
+            page_size=page_size,
+            capacity_hbm_tokens=cap_tokens,
+            dram_capacity_tokens=0,
+            model=model,
+            gpu_flops=cfg["gpu_flops"],
+            pcie_bandwidth=cfg["pcie_bandwidth"],
+        )
+        result = solver.solve(time_limit_s=ORACLE_TIME_LIMIT_S, relax=ORACLE_RELAX)
+        return {"cfg": cfg, "metrics": result.to_run_metrics_dict()}
+
+>>>>>>> Stashed changes
     strategy = strategy_from_name(
         sim_spec["strategy_name"],
         model=model,
@@ -233,8 +301,11 @@ def _sim_worker(args: Tuple) -> Dict[str, Any]:
             capacity_spec=str(cfg["capacity"]),
             ordering=cfg["ordering"],
             model_name=model.name,
+<<<<<<< Updated upstream
+=======
             dram_strategy=sim_spec.get("dram_strategy_name"),
             dram_capacity_spec=str(cfg.get("dram_capacity", "0")),
+>>>>>>> Stashed changes
         )
         logger = TreeLogger(log_dir / fname)
 

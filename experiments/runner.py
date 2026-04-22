@@ -78,10 +78,14 @@ def strategy_from_name(
         return LRUStrategy()
     if n == "fifo":
         return FIFOStrategy()
-    if n == "branch":
-        return BranchStrategy(model=model, **hw_kwargs)
-    if n == "branch_nt":
-        return BranchStrategy(newtouch=True, model=model, **hw_kwargs)
+    m_branch = re.match(r"^branch(_nt)?(_ef)?$", n)
+    if m_branch:
+        return BranchStrategy(
+            newtouch=bool(m_branch.group(1)),
+            evict_filter=bool(m_branch.group(2)),
+            model=model,
+            **hw_kwargs,
+        )
     if n == "marconi" or n.startswith("marconi_"):
         # Optional alpha suffix: "marconi_a2.0" → alpha=2.0
         m = re.search(r"_a([\d.]+)", n)
@@ -111,12 +115,14 @@ def strategy_from_name(
         m_mn = re.search(r"_mn([01])", rest)
         use_mn = bool(m_mn) and m_mn.group(1) == "1"
         newtouch = "_nt" in rest
+        evict_filter = "_ef" in rest
         m_alpha = re.search(r"_a([\d.]+)", rest)
         kwargs = {"alpha": float(m_alpha.group(1))} if m_alpha else {}
         return Marconi3Strategy(
             evict_mode=evict_mode,
             use_mid_chain_checkpoint=use_mn,
             newtouch=newtouch,
+            evict_filter=evict_filter,
             model=model,
             **hw_kwargs,
             **kwargs,

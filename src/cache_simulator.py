@@ -300,6 +300,7 @@ class KVCacheSimulator:
         # ----------------------------------------------------------------
         # 5. Logging (after all mutations have settled).
         # ----------------------------------------------------------------
+<<<<<<< Updated upstream
         pending_splits = self.tree.drain_pending_splits()
         if self.dram_tree is not None:
             self.dram_tree.drain_pending_splits()
@@ -311,6 +312,22 @@ class KVCacheSimulator:
                 log.hit(n)
             for n in hbm_new_nodes:
                 log.insert(n)
+=======
+        pending_ops = self.tree.drain_pending_ops()
+        if self.dram_tree is not None:
+            self.dram_tree.drain_pending_ops()
+        if log:
+            log.request_start(rid, self.tree.clock, total_tokens)
+            # Emit I/SP in chronological order so splits that reference a
+            # just-inserted leaf find the node in the viewer.
+            for op_type, args in pending_ops:
+                if op_type == "I":
+                    log.insert_raw(*args)
+                elif op_type == "SP":
+                    log.split(*args)
+            for n in matched_nodes:
+                log.hit(n)
+>>>>>>> Stashed changes
             for n in hbm_mamba_nodes:
                 log.mamba_set(n)
 
@@ -541,6 +558,10 @@ class KVCacheSimulator:
         if self.capacity_tokens is not None:
             log = self.logger
             cap = self.capacity_tokens
+<<<<<<< Updated upstream
+=======
+            any_evicted = False
+>>>>>>> Stashed changes
             while self.tree.total_cached_tokens() > cap:
                 action = self.strategy.select_eviction(self.tree)
                 if action is None:
@@ -553,12 +574,22 @@ class KVCacheSimulator:
                     continue
 
                 removed = self.tree.remove_leaf(node)
+<<<<<<< Updated upstream
+=======
+                if removed:
+                    any_evicted = True
+>>>>>>> Stashed changes
                 if self.dram_enabled:
                     for rn in removed:
                         demoted_tokens += rn.num_tokens
                         demoted_nodes += 1
                 if log and removed:
                     log.evict(removed)
+            # Full _stra_* snapshot once the eviction pass finishes, iff any
+            # leaf was evicted this request (strategies typically recompute
+            # scores after eviction).
+            if any_evicted and log and hasattr(log, "stra_snapshot"):
+                log.stra_snapshot(self.tree)
 
         if self.dram_enabled and self.dram_capacity is not None:
             assert self.dram_tree is not None and self.dram_strategy is not None
