@@ -300,19 +300,6 @@ class KVCacheSimulator:
         # ----------------------------------------------------------------
         # 5. Logging (after all mutations have settled).
         # ----------------------------------------------------------------
-<<<<<<< Updated upstream
-        pending_splits = self.tree.drain_pending_splits()
-        if self.dram_tree is not None:
-            self.dram_tree.drain_pending_splits()
-        if log:
-            log.request_start(rid, self.tree.clock, total_tokens)
-            for sp in pending_splits:
-                log.split(*sp)
-            for n in matched_nodes:
-                log.hit(n)
-            for n in hbm_new_nodes:
-                log.insert(n)
-=======
         pending_ops = self.tree.drain_pending_ops()
         if self.dram_tree is not None:
             self.dram_tree.drain_pending_ops()
@@ -327,7 +314,6 @@ class KVCacheSimulator:
                     log.split(*args)
             for n in matched_nodes:
                 log.hit(n)
->>>>>>> Stashed changes
             for n in hbm_mamba_nodes:
                 log.mamba_set(n)
 
@@ -558,10 +544,7 @@ class KVCacheSimulator:
         if self.capacity_tokens is not None:
             log = self.logger
             cap = self.capacity_tokens
-<<<<<<< Updated upstream
-=======
             any_evicted = False
->>>>>>> Stashed changes
             while self.tree.total_cached_tokens() > cap:
                 action = self.strategy.select_eviction(self.tree)
                 if action is None:
@@ -574,11 +557,8 @@ class KVCacheSimulator:
                     continue
 
                 removed = self.tree.remove_leaf(node)
-<<<<<<< Updated upstream
-=======
                 if removed:
                     any_evicted = True
->>>>>>> Stashed changes
                 if self.dram_enabled:
                     for rn in removed:
                         demoted_tokens += rn.num_tokens

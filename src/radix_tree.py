@@ -335,12 +335,9 @@ class RadixTree:
         parent.children[pages[0]] = child
         self._add_token_count(child_tokens)
         self._leaf_set.add(child)
-<<<<<<< Updated upstream
-=======
         # Record for logger (chronological — must precede any later split that
         # may mutate this leaf's creation_order).
         self._pending_ops.append(("I", (order, parent.creation_order, child_tokens)))
->>>>>>> Stashed changes
         return child
 
     def set_mamba_at_depth(

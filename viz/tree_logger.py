@@ -32,33 +32,23 @@ def _log_filename(
     capacity_spec: str,
     ordering: str = "original",
     model_name: str | None = None,
-<<<<<<< Updated upstream
-=======
     dram_strategy: str | None = None,
     dram_capacity_spec: str | None = None,
->>>>>>> Stashed changes
     **_extra: object,
 ) -> str:
     """Build a deterministic filename encoding all simulation parameters.
 
     ``model_name`` is appended (when provided) so logs from different
-<<<<<<< Updated upstream
-    architectures don't collide.
-=======
     architectures don't collide.  ``dram_strategy`` / ``dram_capacity_spec``
     are appended when the run uses two-tier (HBM + DRAM) caching.
->>>>>>> Stashed changes
     """
     cap = str(capacity_spec).replace(" ", "")
     name = f"{dataset}_ps{page_size}_{ordering}_{strategy}_cap{cap}"
     if model_name:
         name += f"_{model_name}"
-<<<<<<< Updated upstream
-=======
     if dram_strategy:
         dram_cap = str(dram_capacity_spec).replace(" ", "") if dram_capacity_spec else "0"
         name += f"_dram-{dram_strategy}_dcap{dram_cap}"
->>>>>>> Stashed changes
     return name + ".jsonl"
 
 
